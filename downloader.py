@@ -12,19 +12,23 @@ from typing import Callable, Optional
 from urllib.parse import urlparse
 
 import yt_dlp
-from yt_dlp.utils import DownloadError, ExtractorError
+from yt_dlp.utils import DownloadCancelled, DownloadError, ExtractorError, parse_bytes
 
 ProgressCallback = Callable[[dict], None]
 
 VIDEO_CONTAINERS = ("mp4", "mkv")
 AUDIO_FORMATS = ("mp3", "m4a", "aac", "flac", "wav")
 COVER_FORMATS = ("mp3", "m4a", "flac")
-SUBTITLE_LANGS = ["es(-[0-9]+|-[A-Z]{2})?", "en(-[0-9]+|-[A-Z]{2})?"]
+SUBTITLE_CHOICES = {"es": "Español", "en": "Inglés", "auto": "Automático"}
 RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 ALLOWED_PUNCTUATION = " .()[]&+,'-_!"
 
 
 class DownloaderError(Exception):
+    pass
+
+
+class DownloadCancelledError(DownloaderError):
     pass
 
 
@@ -178,7 +182,50 @@ def build_format(height: Optional[int], audio_only: bool, merge: bool) -> str:
     return f"bv*{cap}+ba/b{cap}/b"
 
 
-def _fetch_subtitles(url: str, output_dir: Path, safe_title: str, ffmpeg_bin: Optional[str]) -> None:
+def _pick_language(code: str, keys: list[str]) -> Optional[str]:
+    if code in keys:
+        return code
+    return next((k for k in keys if k.startswith(code + "-") and not k.endswith("-orig")), None)
+
+
+def choose_subtitle_langs(choice: str, info: dict) -> list[str]:
+    manual = list(info.get("subtitles") or {})
+    automatic = list(info.get("automatic_captions") or {})
+    if choice in ("es", "en"):
+        for keys in (manual, automatic):
+            picked = _pick_language(choice, keys)
+            if picked:
+                return [picked]
+        return []
+    language = (info.get("language") or "").split("-")[0]
+    if language:
+        picked = _pick_language(language, manual)
+        if picked:
+            return [picked]
+    original = next((k for k in automatic if k.endswith("-orig")), None)
+    return [original] if original else []
+
+
+def parse_rate_limit(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+    value = parse_bytes(text.strip())
+    if not value or value <= 0:
+        raise DownloaderError(f"Límite de velocidad no válido: {text!r}. Ejemplos: 500K, 2M")
+    return value
+
+
+def _make_hook(on_progress: Optional[ProgressCallback], should_cancel: Optional[Callable[[], bool]]):
+    def hook(status: dict) -> None:
+        if should_cancel is not None and should_cancel():
+            raise DownloadCancelled()
+        if on_progress is not None:
+            on_progress(status)
+
+    return hook
+
+
+def _fetch_subtitles(url: str, output_dir: Path, safe_title: str, ffmpeg_bin: Optional[str], choice: str) -> None:
     opts: dict = {
         "skip_download": True,
         "outtmpl": str(output_dir / "%(safe_title)s.%(ext)s"),
@@ -189,7 +236,7 @@ def _fetch_subtitles(url: str, output_dir: Path, safe_title: str, ffmpeg_bin: Op
         "windowsfilenames": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitleslangs": SUBTITLE_LANGS,
+        "subtitleslangs": [],
         "subtitlesformat": "srt/best",
         "sleep_interval_subtitles": 1,
         "retries": 3,
@@ -200,6 +247,10 @@ def _fetch_subtitles(url: str, output_dir: Path, safe_title: str, ffmpeg_bin: Op
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False, process=False)
+            langs = choose_subtitle_langs(choice, info)
+            if not langs:
+                return
+            ydl.params["subtitleslangs"] = langs
             info["safe_title"] = safe_title
             ydl.process_ie_result(info, download=True)
     except Exception:
@@ -214,13 +265,17 @@ def download(
     on_progress: Optional[ProgressCallback] = None,
     container: str = "mp4",
     audio_format: str = "mp3",
-    subtitles: bool = False,
+    subtitles: Optional[str] = None,
+    rate_limit: Optional[int] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Path:
     url = validate_url(url)
     if container not in VIDEO_CONTAINERS:
         raise DownloaderError(f"Contenedor no soportado: {container}")
     if audio_format not in AUDIO_FORMATS:
         raise DownloaderError(f"Formato de audio no soportado: {audio_format}")
+    if subtitles is not None and subtitles not in SUBTITLE_CHOICES:
+        raise DownloaderError(f"Idioma de subtítulos no soportado: {subtitles}")
     output_dir = Path(output_dir) if output_dir else default_download_dir()
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -242,7 +297,8 @@ def download(
         "fragment_retries": 10,
         "file_access_retries": 5,
         "socket_timeout": 30,
-        "progress_hooks": [on_progress] if on_progress else [],
+        "progress_hooks": [_make_hook(on_progress, should_cancel)],
+        "ratelimit": rate_limit,
     }
     postprocessors: list[dict] = []
     if ffmpeg_bin:
@@ -274,11 +330,13 @@ def download(
             result = ydl.process_ie_result(info, download=True)
             downloads = result.get("requested_downloads") or []
             path = Path(downloads[0]["filepath"]) if downloads else Path(ydl.prepare_filename(result))
+    except DownloadCancelled as exc:
+        raise DownloadCancelledError("Descarga cancelada.") from exc
     except (DownloadError, ExtractorError) as exc:
         raise _translate_error(exc) from exc
     except OSError as exc:
         raise DownloaderError(f"Error de archivo/disco: {exc}") from exc
 
     if subtitles and not audio_only:
-        _fetch_subtitles(url, output_dir, safe_title, ffmpeg_bin)
+        _fetch_subtitles(url, output_dir, safe_title, ffmpeg_bin, subtitles)
     return path
