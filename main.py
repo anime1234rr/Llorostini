@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-from downloader import AUDIO_FORMATS, VIDEO_CONTAINERS, DownloaderError, VideoInfo, download, get_info, has_ffmpeg
+from downloader import (AUDIO_FORMATS, VIDEO_CONTAINERS, DownloaderError, VideoInfo, default_download_dir, download,
+                        get_info, has_ffmpeg)
 
 
 def show_progress(d: dict) -> None:
@@ -57,9 +58,10 @@ def main() -> int:
     parser.add_argument("url", nargs="?", help="URL del video")
     parser.add_argument("-q", "--quality", type=int, help="altura máxima, ej. 720")
     parser.add_argument("-a", "--audio", action="store_true", help="solo audio")
+    parser.add_argument("-s", "--subtitles", action="store_true", help="descargar subtitulos .srt (es/en)")
     parser.add_argument("-c", "--container", choices=VIDEO_CONTAINERS, help="contenedor de video (mp4 por defecto)")
     parser.add_argument("-f", "--audio-format", choices=AUDIO_FORMATS, help="formato de audio (mp3 por defecto)")
-    parser.add_argument("-o", "--output", default="descargas", help="carpeta de salida")
+    parser.add_argument("-o", "--output", default=str(default_download_dir()), help="carpeta de salida (por defecto: Descargas)")
     args = parser.parse_args()
 
     if not has_ffmpeg():
@@ -84,7 +86,7 @@ def main() -> int:
                 container = container or ask_choice("Contenedor", VIDEO_CONTAINERS)
 
         path = download(url, args.output, height, audio_only, show_progress,
-                        container or "mp4", audio_format or "mp3")
+                        container or "mp4", audio_format or "mp3", args.subtitles)
         print(f"\nListo: {path}")
         return 0
     except DownloaderError as exc:

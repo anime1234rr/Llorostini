@@ -46,4 +46,3 @@ jobs:
           name: LLorostini ${{ steps.ver.outputs.version }}
           files: |
             dist/LLorostini.exe
-          generate_release_notes: true

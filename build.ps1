@@ -18,6 +18,7 @@ if (-not $ffmpeg) {
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name LLorostini `
     --collect-submodules yt_dlp `
+    --collect-all tkinterdnd2 `
     --add-binary "$($ffmpeg.FullName);." `
     gui.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller fallo" }
