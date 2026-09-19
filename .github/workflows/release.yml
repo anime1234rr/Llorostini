@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - "build.ps1"
+      - "requirements.txt"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Leer version y comprobar si ya existe el tag
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path version.py -Pattern '__version__ = "(.*)"').Matches[0].Groups[1].Value
+          $exists = git ls-remote --tags origin "refs/tags/v$v"
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "publish=$([string]::IsNullOrWhiteSpace($exists))" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        if: steps.ver.outputs.publish == 'True'
+        with:
+          python-version: "3.12"
+
+      - name: Compilar
+        if: steps.ver.outputs.publish == 'True'
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Crear tag y release
+        if: steps.ver.outputs.publish == 'True'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: LLorostini ${{ steps.ver.outputs.version }}
+          files: |
+            dist/LLorostini.exe
+            dist/LLorostini.exe.sha256
+          generate_release_notes: true
