@@ -9,7 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 from yt_dlp.postprocessor.common import PostProcessor
@@ -39,6 +39,25 @@ class VideoInfo:
     uploader: str
     duration: Optional[int]
     heights: list[int]
+    thumbnail_url: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PlaylistEntry:
+    index: int
+    video_id: str
+    title: str
+    duration: Optional[int]
+    url: str
+
+
+@dataclass(frozen=True)
+class PlaylistInfo:
+    title: str
+    uploader: str
+    total: int
+    skipped: int
+    entries: list[PlaylistEntry]
     thumbnail_url: Optional[str] = None
 
 
@@ -166,6 +185,62 @@ def _final_path(result: dict) -> Optional[Path]:
     return None
 
 
+def playlist_id(url: str) -> Optional[str]:
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower()
+    if "youtube.com" not in host and "youtu.be" not in host:
+        return None
+    values = parse_qs(parsed.query).get("list")
+    if not values or values[0].startswith("RD"):
+        return None
+    return values[0]
+
+
+def url_kind(url: str) -> str:
+    if playlist_id(url) is None:
+        return "video"
+    parsed = urlparse(url.strip())
+    is_short_link = parsed.netloc.lower().endswith("youtu.be") and len(parsed.path.strip("/")) > 0
+    return "video_in_list" if "v" in parse_qs(parsed.query) or is_short_link else "playlist"
+
+
+def get_playlist_info(url: str) -> PlaylistInfo:
+    url = validate_url(url)
+    list_id = playlist_id(url)
+    if list_id is None:
+        raise DownloaderError("El enlace no corresponde a una lista de reproducción.")
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "logger": _QuietLogger()}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/playlist?list={list_id}", download=False)
+    except (DownloadError, ExtractorError) as exc:
+        raise _translate_error(exc) from exc
+
+    raw = [entry for entry in (info.get("entries") or []) if entry]
+    entries: list[PlaylistEntry] = []
+    skipped = 0
+    for position, entry in enumerate(raw, 1):
+        video_id = entry.get("id")
+        title = entry.get("title") or ""
+        if not video_id or title in ("[Private video]", "[Deleted video]"):
+            skipped += 1
+            continue
+        video_url = entry.get("url") or ""
+        if not video_url.startswith("http"):
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+        entries.append(PlaylistEntry(position, video_id, title or video_id, entry.get("duration"), video_url))
+    if not entries:
+        raise DownloaderError("La lista está vacía o es privada.")
+    return PlaylistInfo(
+        title=info.get("title") or "Lista de reproducción",
+        uploader=info.get("uploader") or info.get("channel") or "desconocido",
+        total=len(raw),
+        skipped=skipped,
+        entries=entries,
+        thumbnail_url=_pick_thumbnail(info) or _pick_thumbnail(raw[0]),
+    )
+
+
 def get_info(url: str) -> VideoInfo:
     url = validate_url(url)
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _QuietLogger()}
@@ -240,10 +315,15 @@ def _make_hook(on_progress: Optional[ProgressCallback], should_cancel: Optional[
     return hook
 
 
-def _fetch_subtitles(url: str, output_dir: Path, ffmpeg_bin: Optional[str], choice: str) -> None:
+def _clean_prefix(prefix: str) -> str:
+    return re.sub(r"[^0-9A-Za-z _.-]", "", prefix)
+
+
+def _fetch_subtitles(url: str, output_dir: Path, ffmpeg_bin: Optional[str], choice: str,
+                     filename_prefix: str = "") -> None:
     opts: dict = {
         "skip_download": True,
-        "outtmpl": str(output_dir / "%(safe_title)s.%(ext)s"),
+        "outtmpl": str(output_dir / f"{_clean_prefix(filename_prefix)}%(safe_title)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -283,6 +363,7 @@ def download(
     subtitles: Optional[str] = None,
     rate_limit: Optional[int] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    filename_prefix: str = "",
 ) -> Path:
     url = validate_url(url)
     if container not in VIDEO_CONTAINERS:
@@ -301,8 +382,9 @@ def download(
     ffmpeg = ffmpeg_bin is not None
     opts: dict = {
         "format": build_format(height, audio_only, ffmpeg),
-        "outtmpl": str(output_dir / "%(safe_title)s.%(ext)s"),
+        "outtmpl": str(output_dir / f"{_clean_prefix(filename_prefix)}%(safe_title)s.%(ext)s"),
         "noplaylist": True,
+        "playlist_items": "1",
         "quiet": True,
         "no_warnings": True,
         "logger": _QuietLogger(),
@@ -352,5 +434,5 @@ def download(
     if path is None:
         raise DownloaderError("No se pudo determinar el archivo descargado.")
     if subtitles and not audio_only:
-        _fetch_subtitles(url, output_dir, ffmpeg_bin, subtitles)
+        _fetch_subtitles(url, output_dir, ffmpeg_bin, subtitles, filename_prefix)
     return path

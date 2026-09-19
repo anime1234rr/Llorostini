@@ -14,9 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 import storage
 import tray
 from downloader import (AUDIO_FORMATS, SUBTITLE_CHOICES, VIDEO_CONTAINERS, DownloadCancelledError, DownloaderError,
-                        default_download_dir, download, fetch_thumbnail, get_info, has_ffmpeg, parse_rate_limit)
-from updater import UpdateError, apply_update, can_self_update, check_for_update, download_update
-from version import APP_NAME, __version__
+                        default_download_dir, download, fetch_thumbnail, get_info, get_playlist_info, has_ffmpeg,
+                        parse_rate_limit, safe_filename, url_kind)
+from updater import UpdateError, apply_update, can_self_update, download_update, fetch_latest_release, is_newer
+from version import APP_NAME, GITHUB_REPO, __version__
 
 try:
     from tkinterdnd2 import DND_ALL, TkinterDnD
@@ -51,6 +52,23 @@ RED = "#ff6b6b"
 FONT = ("Segoe UI", 10)
 
 
+def shorten(text: str, limit: int = 80) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def plain_notes(text: str) -> str:
+    lines = []
+    for line in str(text).replace("\r", "").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("# ").strip()
+        elif stripped.startswith(("- ", "* ")):
+            stripped = "• " + stripped[2:]
+        lines.append(stripped.replace("**", "").replace("`", ""))
+    return "\n".join(lines).strip()
+
+
 def find_urls(text: str) -> list[str]:
     seen: dict[str, None] = {}
     for url in URL_PATTERN.findall(str(text)):
@@ -62,8 +80,8 @@ class App(_Base):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} {__version__}")
-        self.geometry("700x700")
-        self.minsize(660, 660)
+        self.geometry("700x730")
+        self.minsize(660, 690)
         self.configure(bg=BG)
 
         self.events: queue.Queue = queue.Queue()
@@ -84,6 +102,15 @@ class App(_Base):
         self.item_state: dict[str, str] = {}
         self.item_url: dict[str, str] = {}
         self.history_entries: list[dict] = []
+        self.ready = False
+        self.video_info = None
+        self.playlist = None
+        self.thumb_video = None
+        self.thumb_list = None
+        self.item_extra: dict[str, dict] = {}
+        self.skipped_playlists = 0
+        self.latest_release = None
+        self.update_available = False
 
         self.output_dir = tk.StringVar(value=str(default_download_dir()))
         self.url = tk.StringVar()
@@ -96,6 +123,9 @@ class App(_Base):
         self.speed = tk.StringVar(value=speed)
         self.to_tray = tk.BooleanVar(value=bool(self.settings["minimize_to_tray"]) and tray.AVAILABLE)
         self.queue_quality = tk.StringVar(value=BEST)
+        self.pl_from = tk.StringVar(value="1")
+        self.pl_to = tk.StringVar(value="1")
+        self.only_video = tk.BooleanVar(value=True)
 
         self._apply_theme()
         self._build()
@@ -146,6 +176,9 @@ class App(_Base):
         style.configure("Treeview.Heading", background=SURFACE, foreground=MUTED, relief="flat", padding=7)
         style.map("Treeview.Heading", background=[("active", HOVER)])
         style.configure("Vertical.TScrollbar", background=SURFACE, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED)
+        style.configure("TSpinbox", fieldbackground=FIELD, background=SURFACE, foreground=FG, arrowcolor=FG,
+                        insertcolor=FG, bordercolor=BORDER, padding=4)
+        style.map("TSpinbox", bordercolor=[("focus", ACCENT)])
         self.option_add("*TCombobox*Listbox.background", FIELD)
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
@@ -168,7 +201,7 @@ class App(_Base):
         menubar = tk.Menu(self, bg=SURFACE, fg=FG, activebackground=ACCENT, activeforeground="#ffffff", borderwidth=0)
         help_menu = tk.Menu(menubar, tearoff=False, bg=SURFACE, fg=FG, activebackground=ACCENT,
                             activeforeground="#ffffff", borderwidth=0)
-        help_menu.add_command(label="Buscar actualizaciones...", command=lambda: self.check_updates(silent=False))
+        help_menu.add_command(label="Buscar actualizaciones...", command=self._open_update_tab)
         help_menu.add_separator()
         help_menu.add_command(label=f"Versión {__version__}", state="disabled")
         menubar.add_cascade(label="Ayuda", menu=help_menu)
@@ -185,14 +218,17 @@ class App(_Base):
         self.tab_download = ttk.Frame(self.notebook)
         self.tab_queue = ttk.Frame(self.notebook)
         self.tab_history = ttk.Frame(self.notebook)
+        self.tab_update = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_download, text="Descargar")
         self.notebook.add(self.tab_queue, text="Cola")
         self.notebook.add(self.tab_history, text="Historial")
+        self.notebook.add(self.tab_update, text="Actualizaciones")
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_changed())
 
         self._build_download_tab(self.tab_download)
         self._build_queue_tab(self.tab_queue)
         self._build_history_tab(self.tab_history)
+        self._build_update_tab(self.tab_update)
 
         if not has_ffmpeg():
             self._say("Aviso: ffmpeg no encontrado; calidad limitada y sin conversión de audio.", RED)
@@ -221,9 +257,21 @@ class App(_Base):
         self.thumb_lbl = tk.Label(self.thumb_box, bg=FIELD)
         self.thumb_lbl.place(relx=0.5, rely=0.5, anchor="center")
         self.thumb_box.grid_remove()
-        self.info_lbl = ttk.Label(info_row, text="Pega o arrastra un enlace y pulsa Buscar.", style="Muted.TLabel",
-                                  wraplength=380, justify="left")
-        self.info_lbl.grid(row=0, column=1, sticky="w")
+        self.info_col = ttk.Frame(info_row)
+        self.info_col.grid(row=0, column=1, sticky="w")
+        self.info_lbl = ttk.Label(self.info_col, text="Pega o arrastra un enlace y pulsa Buscar.",
+                                  style="Muted.TLabel", wraplength=380, justify="left")
+        self.info_lbl.pack(anchor="w")
+        self.pl_box = ttk.Frame(self.info_col)
+        self.range_row = ttk.Frame(self.pl_box)
+        ttk.Label(self.range_row, text="Videos del").pack(side="left")
+        ttk.Spinbox(self.range_row, from_=1, to=9999, width=5, textvariable=self.pl_from).pack(side="left", padx=6)
+        ttk.Label(self.range_row, text="al").pack(side="left")
+        ttk.Spinbox(self.range_row, from_=1, to=9999, width=5, textvariable=self.pl_to).pack(side="left", padx=6)
+        self.pl_total_lbl = ttk.Label(self.range_row, text="", style="Muted.TLabel")
+        self.pl_total_lbl.pack(side="left", padx=4)
+        self.only_video_chk = ttk.Checkbutton(self.pl_box, text="Solo este video (ignorar la lista)",
+                                              variable=self.only_video, command=self._apply_mode)
 
         ttk.Label(frm, text="Calidad").grid(row=2, column=0, sticky="w", **pad)
         self.quality = ttk.Combobox(frm, state="disabled", values=[BEST])
@@ -361,7 +409,7 @@ class App(_Base):
         if len(urls) > 1:
             added = self._add_urls(urls)
             self.notebook.select(self.tab_queue)
-            self._say(f"{added} enlaces añadidos a la cola.", MUTED)
+            self._say(self._added_message(added), MUTED)
         elif urls:
             self.url.set(urls[0])
             self.notebook.select(self.tab_download)
@@ -412,11 +460,11 @@ class App(_Base):
         if self._thumb_img is not None:
             self.thumb_lbl.config(image=self._thumb_img)
             self.thumb_box.grid()
-            self.info_lbl.grid_configure(padx=(14, 0))
+            self.info_col.grid_configure(padx=(14, 0))
         else:
             self.thumb_lbl.config(image="")
             self.thumb_box.grid_remove()
-            self.info_lbl.grid_configure(padx=0)
+            self.info_col.grid_configure(padx=0)
 
     def _refresh_subs_widget(self) -> None:
         if self.subtitles.get() and not self.audio_only.get():
@@ -426,7 +474,7 @@ class App(_Base):
 
     def _toggle_audio(self) -> None:
         audio = self.audio_only.get()
-        self.quality.config(state="disabled" if audio or not self.heights else "readonly")
+        self.quality.config(state="disabled" if audio or not self.ready else "readonly")
         self.subs_chk.config(state="disabled" if audio else "normal")
         self._refresh_subs_widget()
         if audio:
@@ -454,27 +502,84 @@ class App(_Base):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.search_btn.config(state="disabled" if busy else "normal")
-        self.dl_btn.config(state="disabled" if busy or not self.heights else "normal")
+        self.dl_btn.config(state="disabled" if busy or not self.ready else "normal")
         self._update_queue_buttons()
+        self._refresh_update_buttons()
 
     def on_search(self) -> None:
         if self.busy:
             return
         self._set_busy(True)
+        self.ready = False
         self.heights = []
+        self.video_info = None
+        self.playlist = None
         self.quality.config(state="disabled")
         self.open_btn.grid_remove()
         self._bar_hide()
-        self.info_lbl.config(text="Buscando...")
+        self.pl_box.pack_forget()
+        self.dl_btn.config(text="Descargar")
+        self.info_lbl.config(text="Buscando...", foreground=MUTED)
         self._set_thumbnail(None)
         self._say("")
         url = self.url.get()
 
         def search():
-            info = get_info(url)
-            return info, fetch_thumbnail(info.thumbnail_url)
+            kind = url_kind(url)
+            result = {"kind": kind, "video": None, "playlist": None, "thumb_video": None, "thumb_list": None}
+            if kind != "playlist":
+                result["video"] = get_info(url)
+                result["thumb_video"] = fetch_thumbnail(result["video"].thumbnail_url)
+            if kind != "video":
+                try:
+                    result["playlist"] = get_playlist_info(url)
+                    result["thumb_list"] = fetch_thumbnail(result["playlist"].thumbnail_url)
+                except DownloaderError:
+                    if kind == "playlist":
+                        raise
+            return result
 
         self._run(search, "info")
+
+    def _list_mode(self) -> bool:
+        return self.playlist is not None and (self.video_info is None or not self.only_video.get())
+
+    def _apply_mode(self) -> None:
+        self.pl_box.pack_forget()
+        self.range_row.pack_forget()
+        self.only_video_chk.pack_forget()
+        if self.playlist is None and self.video_info is None:
+            return
+        if self._list_mode():
+            playlist = self.playlist
+            note = f" · {playlist.skipped} no disponibles" if playlist.skipped else ""
+            self.info_lbl.config(text=f"Lista: {shorten(playlist.title, 70)}\n"
+                                      f"{shorten(playlist.uploader, 35)} · {playlist.total} videos{note}",
+                                 foreground=FG)
+            self._set_thumbnail(self.thumb_list)
+            self.heights = []
+            self.quality.config(values=QUEUE_QUALITIES)
+            self.quality.set(BEST)
+            self.dl_btn.config(text="Descargar lista")
+            self.pl_total_lbl.config(text=f"de {playlist.total}")
+            self.range_row.pack(anchor="w", pady=(8, 0))
+        else:
+            info = self.video_info
+            mins, secs = divmod(info.duration or 0, 60)
+            self.info_lbl.config(text=f"{shorten(info.title, 90)}\n{info.uploader} · {mins}:{secs:02d}",
+                                 foreground=FG)
+            self._set_thumbnail(self.thumb_video)
+            self.heights = info.heights
+            self.quality.config(values=[BEST] + [f"{h}p" for h in info.heights])
+            self.quality.set(BEST)
+            self.dl_btn.config(text="Descargar")
+        if self.playlist is not None and self.video_info is not None:
+            self.only_video_chk.pack(anchor="w", pady=(6, 0))
+        if self.range_row.winfo_manager() or self.only_video_chk.winfo_manager():
+            self.pl_box.pack(anchor="w")
+        self.ready = True
+        self._set_busy(self.busy)
+        self._toggle_audio()
 
     def _collect_options(self) -> dict:
         subs = None
@@ -494,7 +599,43 @@ class App(_Base):
             return
         sel = self.quality.get()
         height = None if sel == BEST else int(sel.rstrip("p"))
+        if self._list_mode():
+            self._download_playlist(height)
+            return
         self._start_jobs([{"url": self.url.get(), "height": height, "iid": None}], "single")
+
+    def _download_playlist(self, height: int | None) -> None:
+        playlist = self.playlist
+        try:
+            start = int(self.pl_from.get() or 1)
+            end = int(self.pl_to.get() or playlist.total)
+        except ValueError:
+            messagebox.showerror("Rango no válido", "Escribe números enteros en «Videos del … al …».")
+            return
+        if start < 1 or end < start:
+            messagebox.showerror("Rango no válido", "El primer número debe ser 1 o más y el segundo no puede ser "
+                                                    "menor que el primero.")
+            return
+        selected = [entry for entry in playlist.entries if start <= entry.index <= end]
+        if not selected:
+            messagebox.showinfo("Lista de reproducción", "No hay videos disponibles en ese rango.")
+            return
+        folder = str(Path(self.output_dir.get()) / safe_filename(playlist.title))
+        if len(selected) > 20 and not messagebox.askyesno(
+                "Lista de reproducción",
+                f"Se descargarán {len(selected)} videos en:\n{folder}\n\n¿Continuar?"):
+            return
+        width = max(2, len(str(playlist.total)))
+        jobs = []
+        for entry in selected:
+            prefix = f"{entry.index:0{width}d} - "
+            iid = self._queue_insert(entry.url, f"{prefix}{entry.title}")
+            self.item_extra[iid] = {"out_dir": folder, "prefix": prefix}
+            jobs.append({"url": entry.url, "height": height, "iid": iid, "out_dir": folder, "prefix": prefix})
+        self.notebook.select(self.tab_queue)
+        for job in jobs:
+            self._set_item(job, "En espera")
+        self._start_jobs(jobs, "queue")
 
     def _start_jobs(self, jobs: list[dict], mode: str) -> None:
         try:
@@ -530,9 +671,9 @@ class App(_Base):
                     continue
                 self.events.put(("job_start", (index, job)))
                 try:
-                    path = download(job["url"], opts["out"], job["height"], opts["audio"], hook,
-                                    opts["container"], opts["audio_format"], opts["subs"], opts["rate"],
-                                    self.cancel_event.is_set)
+                    path = download(job["url"], job.get("out_dir") or opts["out"], job["height"], opts["audio"],
+                                    hook, opts["container"], opts["audio_format"], opts["subs"], opts["rate"],
+                                    self.cancel_event.is_set, job.get("prefix", ""))
                     self.events.put(("job_done", (job, path, opts["audio"])))
                 except DownloadCancelledError:
                     self.events.put(("job_cancelled", job))
@@ -653,19 +794,40 @@ class App(_Base):
         self.remove_q_btn.config(state=state)
         self.clear_q_btn.config(state=state)
 
+    def _queue_insert(self, url: str, name: str | None = None) -> str:
+        iid = self.queue_tree.insert("", "end", values=(name or url, "Pendiente"))
+        self.item_url[iid] = url
+        self.item_state[iid] = "Pendiente"
+        return iid
+
     def _add_urls(self, urls: list[str]) -> int:
         known = set(self.item_url.values())
         added = 0
+        self.skipped_playlists = 0
         for url in urls:
             if url in known:
                 continue
-            iid = self.queue_tree.insert("", "end", values=(url, "Pendiente"))
-            self.item_url[iid] = url
-            self.item_state[iid] = "Pendiente"
+            if url_kind(url) == "playlist":
+                self.skipped_playlists += 1
+                continue
+            self._queue_insert(url)
             known.add(url)
             added += 1
         self._update_queue_buttons()
         return added
+
+    def _added_message(self, added: int) -> str:
+        if not added:
+            text = "Esos enlaces ya estaban en la cola."
+        elif added == 1:
+            text = "1 enlace añadido a la cola."
+        else:
+            text = f"{added} enlaces añadidos a la cola."
+        if self.skipped_playlists == 1:
+            text += " 1 es una lista de reproducción: pégala en la pestaña Descargar."
+        elif self.skipped_playlists:
+            text += f" {self.skipped_playlists} son listas de reproducción: pégalas en la pestaña Descargar."
+        return text
 
     def on_add_links(self) -> None:
         dialog = tk.Toplevel(self)
@@ -697,8 +859,7 @@ class App(_Base):
                 messagebox.showinfo("Añadir enlaces", "No se encontró ningún enlace válido.", parent=dialog)
                 return
             added = self._add_urls(urls)
-            self._say(f"{added} enlaces añadidos a la cola." if added else "Esos enlaces ya estaban en la cola.",
-                      MUTED)
+            self._say(self._added_message(added), MUTED)
             dialog.destroy()
 
         ttk.Button(buttons, text="Cargar .txt...", command=load_file).pack(side="left")
@@ -717,6 +878,7 @@ class App(_Base):
             self.queue_tree.delete(iid)
             self.item_state.pop(iid, None)
             self.item_url.pop(iid, None)
+            self.item_extra.pop(iid, None)
         self._update_queue_buttons()
 
     def on_queue_clear_done(self) -> None:
@@ -727,6 +889,7 @@ class App(_Base):
                 self.queue_tree.delete(iid)
                 self.item_state.pop(iid, None)
                 self.item_url.pop(iid, None)
+                self.item_extra.pop(iid, None)
         self._update_queue_buttons()
 
     def on_run_queue(self) -> None:
@@ -734,7 +897,7 @@ class App(_Base):
             return
         selection = self.queue_quality.get()
         height = None if selection == BEST else int(selection.rstrip("p"))
-        jobs = [{"url": self.item_url[iid], "height": height, "iid": iid}
+        jobs = [{"url": self.item_url[iid], "height": height, "iid": iid, **self.item_extra.get(iid, {})}
                 for iid in self.queue_tree.get_children() if self.item_state.get(iid) != "Listo"]
         if not jobs:
             return
@@ -796,33 +959,109 @@ class App(_Base):
             storage.clear_history()
             self._refresh_history()
 
+    def _build_update_tab(self, parent) -> None:
+        frm = ttk.Frame(parent)
+        frm.pack(fill="both", expand=True, padx=14, pady=12)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(4, weight=1)
+
+        ttk.Label(frm, text=f"{APP_NAME} {__version__}", font=("Segoe UI Semibold", 16)).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(frm, text="Versión instalada", style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        self.upd_status = ttk.Label(frm, text="Pulsa «Buscar actualizaciones» para ver si hay una versión nueva.",
+                                    style="Muted.TLabel", wraplength=600, justify="left")
+        self.upd_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        self.notes_title = ttk.Label(frm, text="Novedades de la última versión", style="Muted.TLabel")
+        self.notes_title.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        self.notes_text = tk.Text(frm, height=8, wrap="word", bg=FIELD, fg=FG, relief="flat", font=FONT,
+                                  padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER,
+                                  highlightcolor=BORDER, selectbackground=ACCENT, selectforeground="#ffffff",
+                                  insertbackground=FG, state="disabled")
+        scroll = ttk.Scrollbar(frm, orient="vertical", command=self.notes_text.yview)
+        self.notes_text.configure(yscrollcommand=scroll.set)
+        self.notes_text.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        scroll.grid(row=4, column=2, sticky="ns")
+
+        buttons = ttk.Frame(frm)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.check_btn = ttk.Button(buttons, text="Buscar actualizaciones",
+                                    command=lambda: self.check_updates(silent=False))
+        self.check_btn.pack(side="left")
+        self.update_btn = ttk.Button(buttons, text="Actualizar ahora", style="Accent.TButton",
+                                     command=self.on_update_now, state="disabled")
+        self.update_btn.pack(side="left", padx=8)
+        self.github_btn = ttk.Button(buttons, text="Ver en GitHub", command=self.on_open_release_page)
+        self.github_btn.pack(side="right")
+
+    def _open_update_tab(self) -> None:
+        self.notebook.select(self.tab_update)
+        self.check_updates(silent=False)
+
+    def _refresh_update_buttons(self) -> None:
+        if not hasattr(self, "update_btn"):
+            return
+        release = self.latest_release
+        can_update = (bool(release) and self.update_available and can_self_update()
+                      and bool(release.asset_url) and not self.busy)
+        self.update_btn.config(state="normal" if can_update else "disabled")
+
+    def _show_notes(self, release) -> None:
+        self.notes_title.config(text=f"Novedades de {release.version}")
+        self.notes_text.config(state="normal")
+        self.notes_text.delete("1.0", "end")
+        self.notes_text.insert("1.0", plain_notes(release.notes) or "Esta versión no incluye notas.")
+        self.notes_text.config(state="disabled")
+
     def check_updates(self, silent: bool) -> None:
+        if not silent:
+            self.upd_status.config(text="Buscando actualizaciones...", foreground=MUTED)
+            self.check_btn.config(state="disabled")
+
         def worker() -> None:
             try:
-                self.events.put(("update_found", (check_for_update(), silent)))
+                self.events.put(("update_checked", (fetch_latest_release(), silent)))
             except UpdateError as exc:
-                if not silent:
-                    self.events.put(("update_error", str(exc)))
+                self.events.put(("update_error", (str(exc), silent)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_update_found(self, data) -> None:
+    def _on_update_checked(self, data) -> None:
         release, silent = data
-        if release is None:
-            if not silent:
-                messagebox.showinfo("Actualizaciones", f"Ya tienes la última versión ({__version__}).")
+        self.latest_release = release
+        self.update_available = is_newer(release.version)
+        self.check_btn.config(state="normal")
+        self.notebook.tab(self.tab_update, text="Actualizaciones ●" if self.update_available else "Actualizaciones")
+        self._show_notes(release)
+        if self.update_available:
+            hint = "" if can_self_update() else " La actualización automática solo funciona con el .exe."
+            self.upd_status.config(text=f"Hay una versión nueva: {release.version} (tienes {__version__}).{hint}",
+                                   foreground=GREEN)
+            if silent and not self.busy:
+                self._say(f"Hay una versión nueva ({release.version}). Míralo en la pestaña Actualizaciones.", MUTED)
+        else:
+            self.upd_status.config(text=f"Estás al día. Última versión publicada: {release.version}.", foreground=FG)
+        self._refresh_update_buttons()
+
+    def _on_update_error(self, data) -> None:
+        message, silent = data
+        self.check_btn.config(state="normal")
+        if not silent:
+            self.upd_status.config(text=message, foreground=RED)
+
+    def on_update_now(self) -> None:
+        release = self.latest_release
+        if not release or self.busy:
             return
-        if self.busy:
-            if not silent:
-                messagebox.showinfo("Actualizaciones", "Termina la operación en curso y vuelve a intentarlo.")
-            return
-        notes = release.notes[:600] + ("..." if len(release.notes) > 600 else "")
-        text = f"Hay una versión nueva: {release.version} (tienes {__version__}).\n\n{notes}\n\n"
-        if can_self_update() and release.asset_url:
-            if messagebox.askyesno("Actualización disponible", text + "¿Descargar e instalar ahora?"):
-                self._start_update(release)
-        elif messagebox.askyesno("Actualización disponible", text + "¿Abrir la página de descarga?"):
-            webbrowser.open(release.page_url)
+        if messagebox.askyesno("Actualización disponible",
+                               f"Se descargará la versión {release.version} y la aplicación se reiniciará.\n\n"
+                               "¿Deseas actualizarlo ahora?"):
+            self._start_update(release)
+
+    def on_open_release_page(self) -> None:
+        release = self.latest_release
+        webbrowser.open(release.page_url if release else f"https://github.com/{GITHUB_REPO}/releases")
 
     def _start_update(self, release) -> None:
         self._set_busy(True)
@@ -863,9 +1102,6 @@ class App(_Base):
         self._toggle_audio()
         messagebox.showerror("Actualización", msg)
 
-    def _on_update_error(self, msg: str) -> None:
-        messagebox.showerror("Actualizaciones", msg)
-
     def _run(self, fn, kind: str) -> None:
         def worker() -> None:
             try:
@@ -892,19 +1128,20 @@ class App(_Base):
             pass
 
     def _on_info(self, data) -> None:
-        info, raw = data
-        self._set_thumbnail(raw)
-        mins, secs = divmod(info.duration or 0, 60)
-        self.info_lbl.config(text=f"{info.title}\n{info.uploader} · {mins}:{secs:02d}", foreground=FG)
-        self.heights = info.heights
-        self.quality.config(values=[BEST] + [f"{h}p" for h in info.heights])
-        self.quality.set(BEST)
+        self.video_info = data["video"]
+        self.playlist = data["playlist"]
+        self.thumb_video = data["thumb_video"]
+        self.thumb_list = data["thumb_list"]
+        self.only_video.set(data["kind"] == "video_in_list")
+        if self.playlist is not None:
+            self.pl_from.set("1")
+            self.pl_to.set(str(self.playlist.total))
+        self._apply_mode()
         self._set_busy(False)
-        self._toggle_audio()
 
     def _on_error(self, msg: str) -> None:
-        if not self.heights:
-            self.info_lbl.config(text="Pega o arrastra un enlace y pulsa Buscar.")
+        if not self.ready:
+            self.info_lbl.config(text="Pega o arrastra un enlace y pulsa Buscar.", foreground=MUTED)
         self._bar_hide()
         self._say("")
         self._set_busy(False)
