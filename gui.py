@@ -7,11 +7,13 @@ import re
 import subprocess
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from downloader import (AUDIO_FORMATS, VIDEO_CONTAINERS, DownloaderError, default_download_dir, download,
                         fetch_thumbnail, get_info, has_ffmpeg)
+from updater import UpdateError, apply_update, can_self_update, check_for_update, download_update
 from version import APP_NAME, __version__
 
 try:
@@ -66,8 +68,10 @@ class App(_Base):
         self._apply_theme()
         self._build()
         self._enable_drop()
+        self._build_menu()
         self._dark_titlebar()
         self.after(100, self._poll)
+        self.after(1500, lambda: self.check_updates(silent=True))
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
@@ -117,6 +121,16 @@ class App(_Base):
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
         except Exception:
             pass
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self, bg=SURFACE, fg=FG, activebackground=ACCENT, activeforeground="#ffffff", borderwidth=0)
+        help_menu = tk.Menu(menubar, tearoff=False, bg=SURFACE, fg=FG, activebackground=ACCENT,
+                            activeforeground="#ffffff", borderwidth=0)
+        help_menu.add_command(label="Buscar actualizaciones...", command=lambda: self.check_updates(silent=False))
+        help_menu.add_separator()
+        help_menu.add_command(label=f"Versión {__version__}", state="disabled")
+        menubar.add_cascade(label="Ayuda", menu=help_menu)
+        self.config(menu=menubar)
 
     def _build(self) -> None:
         pad = {"padx": 12, "pady": 7}
@@ -298,6 +312,76 @@ class App(_Base):
         self._say("Iniciando descarga...", MUTED)
         self._run(lambda: download(url, out, height, audio, lambda d: self.events.put(("progress", d)),
                                    cont, afmt, subs), "done")
+
+    def check_updates(self, silent: bool) -> None:
+        def worker() -> None:
+            try:
+                self.events.put(("update_found", (check_for_update(), silent)))
+            except UpdateError as exc:
+                if not silent:
+                    self.events.put(("update_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_found(self, data) -> None:
+        release, silent = data
+        if release is None:
+            if not silent:
+                messagebox.showinfo("Actualizaciones", f"Ya tienes la última versión ({__version__}).")
+            return
+        if self.busy:
+            if not silent:
+                messagebox.showinfo("Actualizaciones", "Termina la operación en curso y vuelve a intentarlo.")
+            return
+        notes = release.notes[:600] + ("..." if len(release.notes) > 600 else "")
+        text = f"Hay una versión nueva: {release.version} (tienes {__version__}).\n\n{notes}\n\n"
+        if can_self_update() and release.asset_url:
+            if messagebox.askyesno("Actualización disponible", text + "¿Descargar e instalar ahora?"):
+                self._start_update(release)
+        elif messagebox.askyesno("Actualización disponible", text + "¿Abrir la página de descarga?"):
+            webbrowser.open(release.page_url)
+
+    def _start_update(self, release) -> None:
+        self._set_busy(True)
+        self._bar_show()
+        self._say("Descargando actualización...", MUTED)
+
+        def on_progress(done: int, total: int) -> None:
+            self.events.put(("update_progress", (done, total)))
+
+        def worker() -> None:
+            try:
+                self.events.put(("update_ready", download_update(release, on_progress)))
+            except UpdateError as exc:
+                self.events.put(("update_failed", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_progress(self, data) -> None:
+        done, total = data
+        if total:
+            self._bar_set(done / total * 100)
+        self._say(f"Descargando actualización... {done / 1_048_576:.1f} MB", MUTED)
+
+    def _on_update_ready(self, path) -> None:
+        self._bar_working()
+        self._say("Reiniciando para aplicar la actualización...", MUTED)
+        try:
+            apply_update(path)
+        except OSError as exc:
+            self._on_update_failed(f"No se pudo aplicar la actualización: {exc}")
+            return
+        self.destroy()
+
+    def _on_update_failed(self, msg: str) -> None:
+        self._bar_hide()
+        self._say("")
+        self._set_busy(False)
+        self._toggle_audio()
+        messagebox.showerror("Actualización", msg)
+
+    def _on_update_error(self, msg: str) -> None:
+        messagebox.showerror("Actualizaciones", msg)
 
     def _run(self, fn, kind: str) -> None:
         def worker() -> None:
