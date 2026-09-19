@@ -6,7 +6,7 @@ import shutil
 import sys
 import unicodedata
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
@@ -40,6 +40,11 @@ class VideoInfo:
     duration: Optional[int]
     heights: list[int]
     thumbnail_url: Optional[str] = None
+    fps_by_height: dict[int, tuple[int, ...]] = field(default_factory=dict)
+
+    @property
+    def fps_options(self) -> list[int]:
+        return sorted({rate for rates in self.fps_by_height.values() for rate in rates}, reverse=True)
 
 
 @dataclass(frozen=True)
@@ -241,6 +246,15 @@ def get_playlist_info(url: str) -> PlaylistInfo:
     )
 
 
+def _collect_fps(info: dict) -> dict[int, tuple[int, ...]]:
+    rates: dict[int, set[int]] = {}
+    for item in info.get("formats") or []:
+        height, rate = item.get("height"), item.get("fps")
+        if height and rate and item.get("vcodec") not in (None, "none"):
+            rates.setdefault(int(height), set()).add(int(round(rate)))
+    return {height: tuple(sorted(values, reverse=True)) for height, values in rates.items()}
+
+
 def get_info(url: str) -> VideoInfo:
     url = validate_url(url)
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _QuietLogger()}
@@ -260,16 +274,22 @@ def get_info(url: str) -> VideoInfo:
         duration=info.get("duration"),
         heights=heights,
         thumbnail_url=_pick_thumbnail(info),
+        fps_by_height=_collect_fps(info),
     )
 
 
-def build_format(height: Optional[int], audio_only: bool, merge: bool) -> str:
+def _fps_filter(fps: Optional[int]) -> str:
+    return f"[fps>={fps - 1}][fps<={fps + 1}]" if fps else ""
+
+
+def build_format(height: Optional[int], audio_only: bool, merge: bool, fps: Optional[int] = None) -> str:
     if audio_only:
         return "ba/b"
     cap = f"[height<={height}]" if height else ""
+    rate = _fps_filter(fps)
     if not merge:
-        return f"b{cap}/b"
-    return f"bv*{cap}+ba/b{cap}/b"
+        return "/".join([f"b{cap}{rate}"] * bool(rate) + [f"b{cap}", "b"])
+    return "/".join([f"bv*{cap}{rate}+ba"] * bool(rate) + [f"bv*{cap}+ba", f"b{cap}", "b"])
 
 
 def _pick_language(code: str, keys: list[str]) -> Optional[str]:
@@ -364,6 +384,7 @@ def download(
     rate_limit: Optional[int] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     filename_prefix: str = "",
+    fps: Optional[int] = None,
 ) -> Path:
     url = validate_url(url)
     if container not in VIDEO_CONTAINERS:
@@ -381,7 +402,7 @@ def download(
     ffmpeg_bin = ffmpeg_path()
     ffmpeg = ffmpeg_bin is not None
     opts: dict = {
-        "format": build_format(height, audio_only, ffmpeg),
+        "format": build_format(height, audio_only, ffmpeg, fps),
         "outtmpl": str(output_dir / f"{_clean_prefix(filename_prefix)}%(safe_title)s.%(ext)s"),
         "noplaylist": True,
         "playlist_items": "1",

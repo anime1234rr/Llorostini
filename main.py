@@ -61,6 +61,7 @@ def main() -> int:
     parser.add_argument("-s", "--subtitles", nargs="?", const="es", choices=list(SUBTITLE_CHOICES),
                         help="descargar subtitulos .srt (es, en o auto; es por defecto)")
     parser.add_argument("-l", "--limit", help="limite de velocidad, ej. 500K o 2M")
+    parser.add_argument("--fps", type=int, help="preferir esta tasa de fotogramas, ej. 60 o 30")
     parser.add_argument("-c", "--container", choices=VIDEO_CONTAINERS, help="contenedor de video (mp4 por defecto)")
     parser.add_argument("-f", "--audio-format", choices=AUDIO_FORMATS, help="formato de audio (mp3 por defecto)")
     parser.add_argument("-o", "--output", default=str(default_download_dir()), help="carpeta de salida (por defecto: Descargas)")
@@ -74,6 +75,8 @@ def main() -> int:
         url = args.url or input("URL del video: ").strip()
         info = get_info(url)
         print(f"\nTítulo: {info.title}\nCanal:  {info.uploader}\nDuración: {fmt_duration(info.duration)}")
+        if info.fps_options:
+            print("FPS disponibles: " + ", ".join(str(value) for value in info.fps_options))
 
         if interactive and args.quality is None and not args.audio:
             height, audio_only = ask_quality(info)
@@ -88,7 +91,8 @@ def main() -> int:
                 container = container or ask_choice("Contenedor", VIDEO_CONTAINERS)
 
         path = download(url, args.output, height, audio_only, show_progress,
-                        container or "mp4", audio_format or "mp3", args.subtitles, parse_rate_limit(args.limit))
+                        container or "mp4", audio_format or "mp3", args.subtitles, parse_rate_limit(args.limit),
+                        fps=args.fps)
         print(f"\nListo: {path}")
         return 0
     except DownloaderError as exc:

@@ -37,6 +37,8 @@ URL_PATTERN = re.compile(r"https?://[^\s{}\"'<>]+")
 
 SPEEDS = {"Sin límite": None, "500 KB/s": "500K", "1 MB/s": "1M", "2 MB/s": "2M", "5 MB/s": "5M", "10 MB/s": "10M"}
 QUEUE_QUALITIES = [BEST, "2160p", "1440p", "1080p", "720p", "480p", "360p"]
+FPS_AUTO = "Automático"
+FPS_PRESETS = [60, 30, 24]
 
 BG = "#14161b"
 SURFACE = "#1e2128"
@@ -126,6 +128,9 @@ class App(_Base):
         self.pl_from = tk.StringVar(value="1")
         self.pl_to = tk.StringVar(value="1")
         self.only_video = tk.BooleanVar(value=True)
+        self.fps_choice = tk.StringVar(value=FPS_AUTO)
+        self.queue_fps = tk.StringVar(value=FPS_AUTO)
+        self._fps_locked = False
 
         self._apply_theme()
         self._build()
@@ -274,9 +279,17 @@ class App(_Base):
                                               variable=self.only_video, command=self._apply_mode)
 
         ttk.Label(frm, text="Calidad").grid(row=2, column=0, sticky="w", **pad)
-        self.quality = ttk.Combobox(frm, state="disabled", values=[BEST])
+        quality_box = ttk.Frame(frm)
+        quality_box.grid(row=2, column=1, sticky="ew", **pad)
+        quality_box.columnconfigure(0, weight=1)
+        self.quality = ttk.Combobox(quality_box, state="disabled", values=[BEST])
         self.quality.set(BEST)
-        self.quality.grid(row=2, column=1, sticky="ew", **pad)
+        self.quality.grid(row=0, column=0, sticky="ew")
+        self.quality.bind("<<ComboboxSelected>>", lambda _e: self._refresh_fps_options())
+        ttk.Label(quality_box, text="FPS").grid(row=0, column=1, padx=(12, 6))
+        self.fps_box = ttk.Combobox(quality_box, state="disabled", width=12, textvariable=self.fps_choice,
+                                    values=[FPS_AUTO])
+        self.fps_box.grid(row=0, column=2)
         ttk.Checkbutton(frm, text="Solo audio", variable=self.audio_only,
                         command=self._toggle_audio).grid(row=2, column=2, sticky="w", **pad)
 
@@ -320,6 +333,10 @@ class App(_Base):
         ttk.Label(quality_row, text="Calidad máxima").pack(side="left")
         ttk.Combobox(quality_row, state="readonly", textvariable=self.queue_quality, values=QUEUE_QUALITIES,
                      width=18).pack(side="left", padx=10)
+        ttk.Label(quality_row, text="FPS").pack(side="left", padx=(12, 0))
+        ttk.Combobox(quality_row, state="readonly", textvariable=self.queue_fps,
+                     values=[FPS_AUTO] + [f"{value} fps" for value in FPS_PRESETS], width=12).pack(side="left",
+                                                                                                  padx=10)
 
         self.queue_tree = ttk.Treeview(frm, columns=("video", "state"), show="headings", selectmode="extended")
         self.queue_tree.heading("video", text="Video o enlace", anchor="w")
@@ -472,6 +489,40 @@ class App(_Base):
         else:
             self.sub_lang_box.pack_forget()
 
+    def _fps_values(self) -> list[int]:
+        if self._list_mode():
+            return list(FPS_PRESETS)
+        info = self.video_info
+        if info is None:
+            return []
+        selection = self.quality.get()
+        if selection.endswith("p") and selection[:-1].isdigit():
+            return list(info.fps_by_height.get(int(selection[:-1]), ()))
+        return info.fps_options
+
+    def _refresh_fps_options(self) -> None:
+        values = self._fps_values() if self.ready else []
+        if self.audio_only.get() or not values:
+            self._fps_locked = False
+            self.fps_box.config(values=[FPS_AUTO], state="disabled")
+            self.fps_choice.set(FPS_AUTO)
+            return
+        if len(values) == 1 and not self._list_mode():
+            label = f"{values[0]} fps"
+            self._fps_locked = True
+            self.fps_box.config(values=[label], state="disabled")
+            self.fps_choice.set(label)
+            return
+        labels = [FPS_AUTO] + [f"{value} fps" for value in values]
+        self.fps_box.config(values=labels, state="readonly")
+        if self._fps_locked or self.fps_choice.get() not in labels:
+            self.fps_choice.set(FPS_AUTO)
+        self._fps_locked = False
+
+    def _selected_fps(self) -> int | None:
+        parts = self.fps_choice.get().split()
+        return int(parts[0]) if parts and parts[0].isdigit() else None
+
     def _toggle_audio(self) -> None:
         audio = self.audio_only.get()
         self.quality.config(state="disabled" if audio or not self.ready else "readonly")
@@ -481,6 +532,7 @@ class App(_Base):
             self.fmt.config(values=AUDIO_FORMATS, textvariable=self.audio_format)
         else:
             self.fmt.config(values=VIDEO_CONTAINERS, textvariable=self.container)
+        self._refresh_fps_options()
 
     def on_browse(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_dir.get())
@@ -515,6 +567,7 @@ class App(_Base):
         self.video_info = None
         self.playlist = None
         self.quality.config(state="disabled")
+        self._refresh_fps_options()
         self.open_btn.grid_remove()
         self._bar_hide()
         self.pl_box.pack_forget()
@@ -602,7 +655,8 @@ class App(_Base):
         if self._list_mode():
             self._download_playlist(height)
             return
-        self._start_jobs([{"url": self.url.get(), "height": height, "iid": None}], "single")
+        self._start_jobs([{"url": self.url.get(), "height": height, "iid": None, "fps": self._selected_fps()}],
+                         "single")
 
     def _download_playlist(self, height: int | None) -> None:
         playlist = self.playlist
@@ -625,13 +679,15 @@ class App(_Base):
                 "Lista de reproducción",
                 f"Se descargarán {len(selected)} videos en:\n{folder}\n\n¿Continuar?"):
             return
+        fps = self._selected_fps()
         width = max(2, len(str(playlist.total)))
         jobs = []
         for entry in selected:
             prefix = f"{entry.index:0{width}d} - "
             iid = self._queue_insert(entry.url, f"{prefix}{entry.title}")
             self.item_extra[iid] = {"out_dir": folder, "prefix": prefix}
-            jobs.append({"url": entry.url, "height": height, "iid": iid, "out_dir": folder, "prefix": prefix})
+            jobs.append({"url": entry.url, "height": height, "iid": iid, "out_dir": folder, "prefix": prefix,
+                         "fps": fps})
         self.notebook.select(self.tab_queue)
         for job in jobs:
             self._set_item(job, "En espera")
@@ -673,7 +729,7 @@ class App(_Base):
                 try:
                     path = download(job["url"], job.get("out_dir") or opts["out"], job["height"], opts["audio"],
                                     hook, opts["container"], opts["audio_format"], opts["subs"], opts["rate"],
-                                    self.cancel_event.is_set, job.get("prefix", ""))
+                                    self.cancel_event.is_set, job.get("prefix", ""), job.get("fps"))
                     self.events.put(("job_done", (job, path, opts["audio"])))
                 except DownloadCancelledError:
                     self.events.put(("job_cancelled", job))
@@ -897,7 +953,10 @@ class App(_Base):
             return
         selection = self.queue_quality.get()
         height = None if selection == BEST else int(selection.rstrip("p"))
-        jobs = [{"url": self.item_url[iid], "height": height, "iid": iid, **self.item_extra.get(iid, {})}
+        fps_parts = self.queue_fps.get().split()
+        queue_fps = int(fps_parts[0]) if fps_parts and fps_parts[0].isdigit() else None
+        jobs = [{"url": self.item_url[iid], "height": height, "iid": iid, "fps": queue_fps,
+                 **self.item_extra.get(iid, {})}
                 for iid in self.queue_tree.get_children() if self.item_state.get(iid) != "Listo"]
         if not jobs:
             return
