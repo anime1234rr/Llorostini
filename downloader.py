@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import DownloadCancelled, DownloadError, ExtractorError, parse_bytes
 
 ProgressCallback = Callable[[dict], None]
@@ -151,6 +152,20 @@ def fetch_thumbnail(url: Optional[str]) -> Optional[bytes]:
         return None
 
 
+class _SafeTitlePP(PostProcessor):
+    def run(self, information):
+        information["safe_title"] = safe_filename(information.get("title") or "video")
+        return [], information
+
+
+def _final_path(result: dict) -> Optional[Path]:
+    for candidate in [result, *(result.get("entries") or [])]:
+        downloads = (candidate or {}).get("requested_downloads") or []
+        if downloads:
+            return Path(downloads[0]["filepath"])
+    return None
+
+
 def get_info(url: str) -> VideoInfo:
     url = validate_url(url)
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _QuietLogger()}
@@ -225,7 +240,7 @@ def _make_hook(on_progress: Optional[ProgressCallback], should_cancel: Optional[
     return hook
 
 
-def _fetch_subtitles(url: str, output_dir: Path, safe_title: str, ffmpeg_bin: Optional[str], choice: str) -> None:
+def _fetch_subtitles(url: str, output_dir: Path, ffmpeg_bin: Optional[str], choice: str) -> None:
     opts: dict = {
         "skip_download": True,
         "outtmpl": str(output_dir / "%(safe_title)s.%(ext)s"),
@@ -246,13 +261,13 @@ def _fetch_subtitles(url: str, output_dir: Path, safe_title: str, ffmpeg_bin: Op
         opts["postprocessors"] = [{"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"}]
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False, process=False)
+            ydl.add_post_processor(_SafeTitlePP(), when="pre_process")
+            info = ydl.extract_info(url, download=False)
             langs = choose_subtitle_langs(choice, info)
             if not langs:
                 return
             ydl.params["subtitleslangs"] = langs
-            info["safe_title"] = safe_title
-            ydl.process_ie_result(info, download=True)
+            ydl.extract_info(url, download=True)
     except Exception:
         pass
 
@@ -324,12 +339,9 @@ def download(
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False, process=False)
-            safe_title = safe_filename(info.get("title") or "video")
-            info["safe_title"] = safe_title
-            result = ydl.process_ie_result(info, download=True)
-            downloads = result.get("requested_downloads") or []
-            path = Path(downloads[0]["filepath"]) if downloads else Path(ydl.prepare_filename(result))
+            ydl.add_post_processor(_SafeTitlePP(), when="pre_process")
+            result = ydl.extract_info(url, download=True)
+            path = _final_path(result)
     except DownloadCancelled as exc:
         raise DownloadCancelledError("Descarga cancelada.") from exc
     except (DownloadError, ExtractorError) as exc:
@@ -337,6 +349,8 @@ def download(
     except OSError as exc:
         raise DownloaderError(f"Error de archivo/disco: {exc}") from exc
 
+    if path is None:
+        raise DownloaderError("No se pudo determinar el archivo descargado.")
     if subtitles and not audio_only:
-        _fetch_subtitles(url, output_dir, safe_title, ffmpeg_bin, subtitles)
+        _fetch_subtitles(url, output_dir, ffmpeg_bin, subtitles)
     return path

@@ -178,6 +178,7 @@ class App(_Base):
         root = ttk.Frame(self)
         root.pack(fill="both", expand=True, padx=12, pady=10)
         self.root_frame = root
+        self._build_bottom(root)
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True)
@@ -192,7 +193,6 @@ class App(_Base):
         self._build_download_tab(self.tab_download)
         self._build_queue_tab(self.tab_queue)
         self._build_history_tab(self.tab_history)
-        self._build_bottom(root)
 
         if not has_ffmpeg():
             self._say("Aviso: ffmpeg no encontrado; calidad limitada y sin conversión de audio.", RED)
@@ -332,7 +332,7 @@ class App(_Base):
 
     def _build_bottom(self, parent) -> None:
         bottom = ttk.Frame(parent)
-        bottom.pack(fill="x", pady=(8, 0))
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
         bottom.columnconfigure(0, weight=1)
         self.bar = ttk.Progressbar(bottom, maximum=100)
         self.bar.grid(row=0, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
@@ -675,12 +675,12 @@ class App(_Base):
         dialog.minsize(420, 260)
         dialog.transient(self)
         ttk.Label(dialog, text="Pega uno o varios enlaces, uno por línea.").pack(anchor="w", padx=16, pady=(16, 8))
-        text = tk.Text(dialog, bg=FIELD, fg=FG, insertbackground=FG, relief="flat", font=FONT, wrap="none",
-                       highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT, padx=8, pady=8,
-                       selectbackground=ACCENT, selectforeground="#ffffff")
-        text.pack(fill="both", expand=True, padx=16)
         buttons = ttk.Frame(dialog)
-        buttons.pack(fill="x", padx=16, pady=14)
+        buttons.pack(side="bottom", fill="x", padx=16, pady=14)
+        text = tk.Text(dialog, width=40, height=8, bg=FIELD, fg=FG, insertbackground=FG, relief="flat", font=FONT,
+                       wrap="none", highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+                       padx=8, pady=8, selectbackground=ACCENT, selectforeground="#ffffff")
+        text.pack(fill="both", expand=True, padx=16)
 
         def load_file() -> None:
             path = filedialog.askopenfilename(parent=dialog, title="Elegir lista de enlaces",
@@ -704,6 +704,8 @@ class App(_Base):
         ttk.Button(buttons, text="Cargar .txt...", command=load_file).pack(side="left")
         ttk.Button(buttons, text="Añadir", style="Accent.TButton", command=accept).pack(side="right")
         ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="right", padx=8)
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        dialog.bind("<Control-Return>", lambda _e: accept())
         self._dark_titlebar(dialog)
         text.focus_set()
         dialog.grab_set()
