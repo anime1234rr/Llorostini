@@ -23,7 +23,4 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller fallo" }
 
 $exe = Join-Path $PSScriptRoot "dist\LLorostini.exe"
-$hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-"$hash  LLorostini.exe" | Set-Content -Encoding ascii "$exe.sha256"
 Write-Host "Listo: $exe"
-Write-Host "SHA256: $hash"
