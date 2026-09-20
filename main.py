@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import sys
 
+import netutil
+
 from downloader import (AUDIO_FORMATS, SUBTITLE_CHOICES, VIDEO_CONTAINERS, DownloaderError, VideoInfo,
-                        default_download_dir, download, get_info, has_ffmpeg, parse_rate_limit)
+                        default_download_dir, download, get_info, has_ffmpeg, parse_rate_limit, THUMBNAIL_FORMATS)
 
 
 def show_progress(d: dict) -> None:
@@ -62,6 +64,10 @@ def main() -> int:
                         help="descargar subtitulos .srt (es, en o auto; es por defecto)")
     parser.add_argument("-l", "--limit", help="limite de velocidad, ej. 500K o 2M")
     parser.add_argument("--fps", type=int, help="preferir esta tasa de fotogramas, ej. 60 o 30")
+    parser.add_argument("-t", "--thumbnail", nargs="?", const="jpg", choices=list(THUMBNAIL_FORMATS),
+                        help="guardar la miniatura junto al archivo (jpg o webp)")
+    parser.add_argument("--lyrics", action="store_true", help="incrustar letras en el audio (mp3, m4a, flac)")
+    parser.add_argument("--proxy", help="proxy, ej. http://127.0.0.1:8080 o socks5://127.0.0.1:1080")
     parser.add_argument("-c", "--container", choices=VIDEO_CONTAINERS, help="contenedor de video (mp4 por defecto)")
     parser.add_argument("-f", "--audio-format", choices=AUDIO_FORMATS, help="formato de audio (mp3 por defecto)")
     parser.add_argument("-o", "--output", default=str(default_download_dir()), help="carpeta de salida (por defecto: Descargas)")
@@ -71,6 +77,10 @@ def main() -> int:
         print("Aviso: ffmpeg no está instalado. Se descargará un solo archivo (calidad limitada, sin mp3).\n")
 
     try:
+        try:
+            netutil.set_proxy(args.proxy)
+        except ValueError as exc:
+            raise DownloaderError(str(exc)) from exc
         interactive = args.url is None
         url = args.url or input("URL del video: ").strip()
         info = get_info(url)
@@ -92,7 +102,7 @@ def main() -> int:
 
         path = download(url, args.output, height, audio_only, show_progress,
                         container or "mp4", audio_format or "mp3", args.subtitles, parse_rate_limit(args.limit),
-                        fps=args.fps)
+                        fps=args.fps, thumbnail=args.thumbnail, lyrics=args.lyrics)
         print(f"\nListo: {path}")
         return 0
     except DownloaderError as exc:

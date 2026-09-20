@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import tkinter as tk
+import unicodedata
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlparse
 
 import storage
+import netutil
+import orphans
 import tray
 from downloader import (AUDIO_FORMATS, SUBTITLE_CHOICES, VIDEO_CONTAINERS, DownloadCancelledError, DownloaderError,
                         default_download_dir, download, fetch_thumbnail, get_info, get_playlist_info, has_ffmpeg,
-                        parse_rate_limit, safe_filename, url_kind)
+                        parse_rate_limit, safe_filename, url_kind, THUMBNAIL_FORMATS, estimate_playlist_size,
+                        estimate_seconds_size, estimate_video_size, format_size, free_space)
 from updater import UpdateError, apply_update, can_self_update, download_update, fetch_latest_release, is_newer
 from version import APP_NAME, GITHUB_REPO, __version__
 
@@ -39,18 +47,47 @@ SPEEDS = {"Sin límite": None, "500 KB/s": "500K", "1 MB/s": "1M", "2 MB/s": "2M
 QUEUE_QUALITIES = [BEST, "2160p", "1440p", "1080p", "720p", "480p", "360p"]
 FPS_AUTO = "Automático"
 FPS_PRESETS = [60, 30, 24]
+PARALLEL_CHOICES = ("1", "2", "3")
+FINISHED_STATES = ("Listo", "Omitido")
+SPACE_MARGIN = 1.15
+MIN_FREE_BYTES = 500 * 1024 * 1024
+DEFAULT_ITEM_SECONDS = 300
 
-BG = "#14161b"
-SURFACE = "#1e2128"
-FIELD = "#252932"
-BORDER = "#323744"
-HOVER = "#2d323d"
-FG = "#e8eaf0"
-MUTED = "#8b93a5"
-ACCENT = "#5b8cff"
-ACCENT_HOVER = "#7aa1ff"
-GREEN = "#3ddc84"
-RED = "#ff6b6b"
+COLOR_KEYS = ("BG", "SURFACE", "FIELD", "BORDER", "HOVER", "FG", "MUTED", "ACCENT", "ACCENT_HOVER", "ACCENT_TEXT",
+              "GREEN", "RED")
+COLOR_OPTIONS = ("bg", "background", "fg", "foreground", "highlightbackground", "highlightcolor", "insertbackground",
+                 "selectbackground", "selectforeground", "activebackground", "activeforeground", "troughcolor")
+
+PALETTES = {
+    "Oscuro": dict(BG="#14161b", SURFACE="#1e2128", FIELD="#252932", BORDER="#323744", HOVER="#2d323d",
+                   FG="#e8eaf0", MUTED="#8b93a5", ACCENT="#5b8cff", ACCENT_HOVER="#7aa1ff", ACCENT_TEXT="#ffffff",
+                   GREEN="#3ddc84", RED="#ff6b6b", DARK=True),
+    "Claro": dict(BG="#f3f4f7", SURFACE="#e6e9ef", FIELD="#fdfdfe", BORDER="#a9b2c1", HOVER="#d9dde5",
+                  FG="#1b1e27", MUTED="#5f6675", ACCENT="#2f63e0", ACCENT_HOVER="#4a7aee", ACCENT_TEXT="#ffffff",
+                  GREEN="#188a4a", RED="#c93838", DARK=False),
+    "Cyberpunk": dict(BG="#0a0512", SURFACE="#170a2b", FIELD="#1f1040", BORDER="#42217c", HOVER="#2b1660",
+                      FG="#f0eaff", MUTED="#a38fd6", ACCENT="#e01fbd", ACCENT_HOVER="#ff4fd8", ACCENT_TEXT="#ffffff",
+                      GREEN="#00f0a0", RED="#ff4d6d", DARK=True),
+    "Minimalista": dict(BG="#111111", SURFACE="#191919", FIELD="#1f1f1f", BORDER="#2e2e2e", HOVER="#262626",
+                        FG="#f0f0f0", MUTED="#8c8c8c", ACCENT="#e6e6e6", ACCENT_HOVER="#ffffff", ACCENT_TEXT="#0d0d0d",
+                        GREEN="#7fd3a0", RED="#e07a7a", DARK=True),
+}
+DEFAULT_THEME = "Oscuro"
+ACTIVE: dict = {}
+ACTIVE_THEME = DEFAULT_THEME
+
+
+def use_palette(name: str) -> None:
+    global ACTIVE_THEME
+    if name not in PALETTES:
+        name = DEFAULT_THEME
+    ACTIVE_THEME = name
+    ACTIVE.clear()
+    ACTIVE.update(PALETTES[name])
+    globals().update(PALETTES[name])
+
+
+use_palette(DEFAULT_THEME)
 FONT = ("Segoe UI", 10)
 
 
@@ -78,13 +115,59 @@ def find_urls(text: str) -> list[str]:
     return list(seen)
 
 
+def fold(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", str(text))
+    return "".join(char for char in decomposed if not unicodedata.combining(char)).casefold()
+
+
+def youtube_url(text: str) -> str | None:
+    for url in find_urls(text):
+        host = urlparse(url).netloc.lower()
+        if host == "youtu.be" or host.endswith(".youtu.be") or "youtube.com" in host:
+            return url
+    return None
+
+
+def read_queue_file(path: Path) -> tuple[list[dict], str | None, str | None]:
+    text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    if path.suffix.lower() == ".json" or text.lstrip().startswith(("{", "[")):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, (dict, list)):
+            raw = data.get("items", []) if isinstance(data, dict) else data
+            items = []
+            for entry in raw if isinstance(raw, list) else []:
+                record = entry if isinstance(entry, dict) else {"url": entry}
+                found = find_urls(str(record.get("url") or ""))
+                if not found:
+                    continue
+                title = record.get("title")
+                item = {"url": found[0], "title": title if isinstance(title, str) else None}
+                for key in ("out_dir", "prefix"):
+                    if isinstance(record.get(key), str) and record[key]:
+                        item[key] = record[key]
+                duration = record.get("duration")
+                if isinstance(duration, (int, float)) and duration > 0:
+                    item["duration"] = int(duration)
+                items.append(item)
+            quality = data.get("quality") if isinstance(data, dict) else None
+            fps = data.get("fps") if isinstance(data, dict) else None
+            return items, quality, fps
+    return [{"url": url, "title": None} for url in find_urls(text)], None, None
+
+
 class App(_Base):
     def __init__(self) -> None:
         super().__init__()
+        use_palette(str(storage.load_settings().get("theme", DEFAULT_THEME)))
         self.title(f"{APP_NAME} {__version__}")
         self.geometry("700x730")
         self.minsize(660, 690)
         self.configure(bg=BG)
+        self._titlebar_state: dict[str, bool] = {}
+        self._dark_titlebar(self)
 
         self.events: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
@@ -104,6 +187,8 @@ class App(_Base):
         self.item_state: dict[str, str] = {}
         self.item_url: dict[str, str] = {}
         self.history_entries: list[dict] = []
+        self._clip_url = ""
+        self._clip_dismissed = ""
         self.ready = False
         self.video_info = None
         self.playlist = None
@@ -113,6 +198,11 @@ class App(_Base):
         self.skipped_playlists = 0
         self.latest_release = None
         self.update_available = False
+        self.jobs_done = 0
+        self.job_frac: dict[int, float] = {}
+        self.job_speed: dict[int, float] = {}
+        self.parallel_active = False
+        self.failures: list[tuple[str, str]] = []
 
         self.output_dir = tk.StringVar(value=str(default_download_dir()))
         self.url = tk.StringVar()
@@ -126,21 +216,95 @@ class App(_Base):
         self.to_tray = tk.BooleanVar(value=bool(self.settings["minimize_to_tray"]) and tray.AVAILABLE)
         self.queue_quality = tk.StringVar(value=BEST)
         self.pl_from = tk.StringVar(value="1")
+        self.history_filter = tk.StringVar()
         self.pl_to = tk.StringVar(value="1")
         self.only_video = tk.BooleanVar(value=True)
         self.fps_choice = tk.StringVar(value=FPS_AUTO)
         self.queue_fps = tk.StringVar(value=FPS_AUTO)
         self._fps_locked = False
+        self.save_thumb = tk.BooleanVar(value=bool(self.settings["save_thumbnail"]))
+        thumb_format = self.settings["thumbnail_format"]
+        self.thumb_format = tk.StringVar(value=thumb_format if thumb_format in THUMBNAIL_FORMATS
+                                         else THUMBNAIL_FORMATS[0])
+        self.embed_lyrics = tk.BooleanVar(value=bool(self.settings["embed_lyrics"]))
+        self.by_channel = tk.BooleanVar(value=bool(self.settings["by_channel"]))
+        self.proxy = tk.StringVar(value=str(self.settings["proxy"]))
+        self.theme = tk.StringVar(value=ACTIVE_THEME)
+        parallel = str(self.settings.get("parallel_downloads", 1))
+        self.parallel = tk.StringVar(value=parallel if parallel in PARALLEL_CHOICES else PARALLEL_CHOICES[0])
+        try:
+            netutil.set_proxy(self.proxy.get())
+        except ValueError:
+            pass
 
         self._apply_theme()
         self._build()
         self._build_menu()
         self._enable_drop()
-        self._dark_titlebar(self)
-        for var in (self.speed, self.to_tray, self.sub_lang):
+        for var in (self.speed, self.to_tray, self.sub_lang, self.save_thumb, self.thumb_format, self.embed_lyrics,
+                    self.by_channel, self.proxy, self.parallel):
             var.trace_add("write", lambda *_: self._save_settings())
+        for var in (self.output_dir, self.pl_from, self.pl_to, self.audio_format):
+            var.trace_add("write", lambda *_: self._refresh_space())
+        self._bind_shortcuts()
+        self._refresh_space()
+        self.history_filter.trace_add("write", lambda *_: self._refresh_history())
+        self.url.trace_add("write", lambda *_: self._on_url_typed())
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.after(700, self._check_clipboard)
+        self.after(900, self._sweep_orphans)
         self.after(100, self._poll)
         self.after(1500, lambda: self.check_updates(silent=True))
+
+    def on_theme_change(self) -> None:
+        name = self.theme.get()
+        if name not in PALETTES or name == ACTIVE_THEME:
+            return
+        old = dict(ACTIVE)
+        use_palette(name)
+        mapping = {str(old[key]).lower(): ACTIVE[key] for key in COLOR_KEYS
+                   if str(old[key]).lower() != str(ACTIVE[key]).lower()}
+        self._apply_theme()
+        self._recolor(self, mapping)
+        self._configure_tree_tags()
+        self._update_popdowns()
+        self._save_settings()
+        self._offer_restart_for_titlebar()
+
+    def _recolor(self, widget, mapping: dict) -> None:
+        for option in COLOR_OPTIONS:
+            try:
+                current = str(widget.cget(option)).lower()
+            except tk.TclError:
+                continue
+            new = mapping.get(current)
+            if new:
+                try:
+                    widget.configure(**{option: new})
+                except tk.TclError:
+                    pass
+        for child in widget.winfo_children():
+            self._recolor(child, mapping)
+
+    def _configure_tree_tags(self) -> None:
+        self.queue_tree.tag_configure("ok", foreground=GREEN)
+        self.queue_tree.tag_configure("err", foreground=RED)
+        self.queue_tree.tag_configure("run", foreground=ACCENT_HOVER)
+        self.history_tree.tag_configure("err", foreground=RED)
+
+    def _update_popdowns(self) -> None:
+        def walk(widget) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Combobox):
+                    try:
+                        popdown = str(self.tk.call("ttk::combobox::PopdownWindow", str(child)))
+                        self.tk.call(popdown + ".f.l", "configure", "-background", FIELD, "-foreground", FG,
+                                     "-selectbackground", ACCENT, "-selectforeground", ACCENT_TEXT)
+                    except tk.TclError:
+                        pass
+                walk(child)
+
+        walk(self)
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
@@ -153,9 +317,12 @@ class App(_Base):
         style.configure("TButton", background=SURFACE, foreground=FG, padding=(14, 7), borderwidth=1)
         style.map("TButton", background=[("active", HOVER), ("disabled", BG)],
                   foreground=[("disabled", MUTED)], bordercolor=[("focus", ACCENT)])
-        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", bordercolor=ACCENT, padding=(14, 9))
+        style.configure("Accent.TButton", background=ACCENT, foreground=ACCENT_TEXT, bordercolor=ACCENT, padding=(14, 9))
         style.map("Accent.TButton", background=[("active", ACCENT_HOVER), ("disabled", SURFACE)],
                   foreground=[("disabled", MUTED)], bordercolor=[("disabled", BORDER)])
+        style.configure("Small.TButton", background=SURFACE, foreground=FG, padding=(9, 3), borderwidth=1)
+        style.map("Small.TButton", background=[("active", HOVER), ("disabled", BG)],
+                  foreground=[("disabled", MUTED)], bordercolor=[("focus", ACCENT)])
         style.configure("TEntry", fieldbackground=FIELD, foreground=FG, insertcolor=FG, padding=6)
         style.map("TEntry", bordercolor=[("focus", ACCENT)])
         style.configure("TCombobox", fieldbackground=FIELD, background=SURFACE, foreground=FG,
@@ -177,21 +344,28 @@ class App(_Base):
         style.map("TNotebook.Tab", background=[("selected", FIELD)], foreground=[("selected", FG)])
         style.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=FG, bordercolor=BORDER,
                         rowheight=28, borderwidth=0)
-        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
+        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", ACCENT_TEXT)])
         style.configure("Treeview.Heading", background=SURFACE, foreground=MUTED, relief="flat", padding=7)
         style.map("Treeview.Heading", background=[("active", HOVER)])
-        style.configure("Vertical.TScrollbar", background=SURFACE, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED)
+        for scrollbar in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(scrollbar, background=SURFACE, troughcolor=BG, bordercolor=BORDER, arrowcolor=MUTED,
+                            lightcolor=SURFACE, darkcolor=SURFACE)
+            style.map(scrollbar, background=[("disabled", BG), ("pressed", HOVER), ("active", HOVER)],
+                      arrowcolor=[("disabled", BORDER)])
         style.configure("TSpinbox", fieldbackground=FIELD, background=SURFACE, foreground=FG, arrowcolor=FG,
                         insertcolor=FG, bordercolor=BORDER, padding=4)
         style.map("TSpinbox", bordercolor=[("focus", ACCENT)])
         self.option_add("*TCombobox*Listbox.background", FIELD)
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
-        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.selectForeground", ACCENT_TEXT)
         self.option_add("*TCombobox*Listbox.font", FONT)
 
     def _dark_titlebar(self, window) -> None:
-        if os.name != "nt":
+        if os.name != "nt" or not DARK:
+            return
+        key = str(window)
+        if self._titlebar_state.get(key):
             return
         try:
             import ctypes
@@ -199,13 +373,35 @@ class App(_Base):
             hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
             value = ctypes.c_int(1)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+            self._titlebar_state[key] = True
         except Exception:
             pass
 
+    def _offer_restart_for_titlebar(self) -> None:
+        if os.name != "nt" or bool(DARK) == self._titlebar_state.get(str(self), False):
+            return
+        if messagebox.askyesno("Cambio de tema",
+                               "El tema ya está aplicado, pero la barra de título de la ventana solo cambia al "
+                               "reiniciar LLorostini.\n\n¿Reiniciar ahora?"):
+            self._restart()
+
+    def _restart(self) -> None:
+        frozen = bool(getattr(sys, "frozen", False))
+        command = [sys.executable] if frozen else [sys.executable, os.path.abspath(sys.argv[0])]
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            subprocess.Popen(command, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}, cwd=os.getcwd(),
+                             creationflags=flags, close_fds=True)
+        except OSError as exc:
+            messagebox.showerror("Error", f"No se pudo reiniciar la aplicación: {exc}")
+            return
+        self.tray.stop()
+        self.destroy()
+
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self, bg=SURFACE, fg=FG, activebackground=ACCENT, activeforeground="#ffffff", borderwidth=0)
+        menubar = tk.Menu(self, bg=SURFACE, fg=FG, activebackground=ACCENT, activeforeground=ACCENT_TEXT, borderwidth=0)
         help_menu = tk.Menu(menubar, tearoff=False, bg=SURFACE, fg=FG, activebackground=ACCENT,
-                            activeforeground="#ffffff", borderwidth=0)
+                            activeforeground=ACCENT_TEXT, borderwidth=0)
         help_menu.add_command(label="Buscar actualizaciones...", command=self._open_update_tab)
         help_menu.add_separator()
         help_menu.add_command(label=f"Versión {__version__}", state="disabled")
@@ -224,16 +420,19 @@ class App(_Base):
         self.tab_queue = ttk.Frame(self.notebook)
         self.tab_history = ttk.Frame(self.notebook)
         self.tab_update = ttk.Frame(self.notebook)
+        self.tab_settings = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_download, text="Descargar")
         self.notebook.add(self.tab_queue, text="Cola")
         self.notebook.add(self.tab_history, text="Historial")
         self.notebook.add(self.tab_update, text="Actualizaciones")
+        self.notebook.add(self.tab_settings, text="Ajustes")
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_changed())
 
         self._build_download_tab(self.tab_download)
         self._build_queue_tab(self.tab_queue)
         self._build_history_tab(self.tab_history)
         self._build_update_tab(self.tab_update)
+        self._build_settings_tab(self.tab_settings)
 
         if not has_ffmpeg():
             self._say("Aviso: ffmpeg no encontrado; calidad limitada y sin conversión de audio.", RED)
@@ -267,6 +466,13 @@ class App(_Base):
         self.info_lbl = ttk.Label(self.info_col, text="Pega o arrastra un enlace y pulsa Buscar.",
                                   style="Muted.TLabel", wraplength=380, justify="left")
         self.info_lbl.pack(anchor="w")
+        self.clip_bar = ttk.Frame(self.info_col)
+        self.clip_label = ttk.Label(self.clip_bar, text="", style="Muted.TLabel")
+        self.clip_label.pack(side="left")
+        ttk.Button(self.clip_bar, text="Usar", style="Small.TButton", command=self._use_clipboard_url).pack(
+            side="left", padx=(10, 4))
+        ttk.Button(self.clip_bar, text="✕", style="Small.TButton", width=3, command=self._dismiss_clipboard).pack(
+            side="left")
         self.pl_box = ttk.Frame(self.info_col)
         self.range_row = ttk.Frame(self.pl_box)
         ttk.Label(self.range_row, text="Videos del").pack(side="left")
@@ -285,7 +491,7 @@ class App(_Base):
         self.quality = ttk.Combobox(quality_box, state="disabled", values=[BEST])
         self.quality.set(BEST)
         self.quality.grid(row=0, column=0, sticky="ew")
-        self.quality.bind("<<ComboboxSelected>>", lambda _e: self._refresh_fps_options())
+        self.quality.bind("<<ComboboxSelected>>", lambda _e: (self._refresh_fps_options(), self._refresh_space()))
         ttk.Label(quality_box, text="FPS").grid(row=0, column=1, padx=(12, 6))
         self.fps_box = ttk.Combobox(quality_box, state="disabled", width=12, textvariable=self.fps_choice,
                                     values=[FPS_AUTO])
@@ -312,12 +518,15 @@ class App(_Base):
                 row=4, column=2, sticky="w", **pad)
 
         ttk.Label(frm, text="Carpeta").grid(row=5, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.output_dir).grid(row=5, column=1, sticky="ew", **pad)
+        self.folder_entry = ttk.Entry(frm, textvariable=self.output_dir)
+        self.folder_entry.grid(row=5, column=1, sticky="ew", **pad)
         ttk.Button(frm, text="Elegir...", command=self.on_browse).grid(row=5, column=2, sticky="ew", **pad)
 
         self.dl_btn = ttk.Button(frm, text="Descargar", style="Accent.TButton", command=self.on_download,
                                  state="disabled")
-        self.dl_btn.grid(row=6, column=0, columnspan=3, sticky="ew", **pad)
+        self.space_lbl = ttk.Label(frm, text="", style="Muted.TLabel")
+        self.space_lbl.grid(row=6, column=1, columnspan=2, sticky="w", padx=12)
+        self.dl_btn.grid(row=7, column=0, columnspan=3, sticky="ew", **pad)
 
     def _build_queue_tab(self, parent) -> None:
         frm = ttk.Frame(parent)
@@ -329,7 +538,7 @@ class App(_Base):
                   style="Muted.TLabel", wraplength=600, justify="left").grid(row=0, column=0, columnspan=2,
                                                                               sticky="w", pady=(0, 8))
         quality_row = ttk.Frame(frm)
-        quality_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        quality_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         ttk.Label(quality_row, text="Calidad máxima").pack(side="left")
         ttk.Combobox(quality_row, state="readonly", textvariable=self.queue_quality, values=QUEUE_QUALITIES,
                      width=18).pack(side="left", padx=10)
@@ -337,6 +546,12 @@ class App(_Base):
         ttk.Combobox(quality_row, state="readonly", textvariable=self.queue_fps,
                      values=[FPS_AUTO] + [f"{value} fps" for value in FPS_PRESETS], width=12).pack(side="left",
                                                                                                   padx=10)
+        self.load_q_btn = ttk.Button(quality_row, text="Cargar cola...", style="Small.TButton",
+                                     command=self.on_queue_load)
+        self.load_q_btn.pack(side="right")
+        self.save_q_btn = ttk.Button(quality_row, text="Guardar cola...", style="Small.TButton",
+                                     command=self.on_queue_save)
+        self.save_q_btn.pack(side="right", padx=(0, 6))
 
         self.queue_tree = ttk.Treeview(frm, columns=("video", "state"), show="headings", selectmode="extended")
         self.queue_tree.heading("video", text="Video o enlace", anchor="w")
@@ -367,7 +582,19 @@ class App(_Base):
         frm = ttk.Frame(parent)
         frm.pack(fill="both", expand=True, padx=12, pady=10)
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        search_row = ttk.Frame(frm)
+        search_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        search_row.columnconfigure(1, weight=1)
+        ttk.Label(search_row, text="Buscar").grid(row=0, column=0, padx=(0, 10))
+        self.history_search = ttk.Entry(search_row, textvariable=self.history_filter)
+        self.history_search.grid(row=0, column=1, sticky="ew")
+        self.history_search.bind("<Escape>", lambda _e: self.history_filter.set(""))
+        ttk.Button(search_row, text="✕", style="Small.TButton", width=3,
+                   command=lambda: self.history_filter.set("")).grid(row=0, column=2, padx=(6, 0))
+        self.history_count = ttk.Label(search_row, text="", style="Muted.TLabel")
+        self.history_count.grid(row=0, column=3, padx=(12, 0))
 
         self.history_tree = ttk.Treeview(frm, columns=("name", "kind", "date"), show="headings",
                                          selectmode="browse")
@@ -377,15 +604,16 @@ class App(_Base):
         self.history_tree.column("name", width=360, anchor="w")
         self.history_tree.column("kind", width=70, anchor="w")
         self.history_tree.column("date", width=130, anchor="w")
+        self.history_tree.tag_configure("err", foreground=RED)
         scroll = ttk.Scrollbar(frm, orient="vertical", command=self.history_tree.yview)
         self.history_tree.configure(yscrollcommand=scroll.set)
-        self.history_tree.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
+        self.history_tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
         self.history_tree.bind("<Double-1>", lambda _e: self.on_history_play())
         self.history_tree.bind("<<TreeviewSelect>>", lambda _e: self._update_history_buttons())
 
         buttons = ttk.Frame(frm)
-        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         self.play_btn = ttk.Button(buttons, text="Reproducir", style="Accent.TButton", command=self.on_history_play)
         self.play_btn.pack(side="left")
         self.reveal_btn = ttk.Button(buttons, text="Abrir carpeta", command=self.on_history_reveal)
@@ -410,6 +638,9 @@ class App(_Base):
         self.open_btn = ttk.Button(bottom, text="Abrir carpeta", command=self.on_open_folder)
         self.open_btn.grid(row=1, column=2, padx=(6, 0))
         self.open_btn.grid_remove()
+        self.notice = ttk.Label(bottom, text="", wraplength=640, justify="left")
+        self.notice.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
+        self.notice.grid_remove()
 
     def _enable_drop(self) -> None:
         if DND_ALL is None:
@@ -439,6 +670,13 @@ class App(_Base):
             "speed_limit": self.speed.get(),
             "minimize_to_tray": bool(self.to_tray.get()),
             "subtitle_lang": lang,
+            "save_thumbnail": bool(self.save_thumb.get()),
+            "thumbnail_format": self.thumb_format.get(),
+            "embed_lyrics": bool(self.embed_lyrics.get()),
+            "by_channel": bool(self.by_channel.get()),
+            "proxy": self.proxy.get().strip(),
+            "theme": ACTIVE_THEME,
+            "parallel_downloads": int(self.parallel.get() or 1),
         })
 
     def _say(self, text: str, color: str = FG) -> None:
@@ -533,6 +771,261 @@ class App(_Base):
         else:
             self.fmt.config(values=VIDEO_CONTAINERS, textvariable=self.container)
         self._refresh_fps_options()
+        self._refresh_space()
+
+    def _range_values(self) -> tuple[int, int]:
+        total = self.playlist.total if self.playlist else 1
+        try:
+            start = int(self.pl_from.get() or 1)
+        except ValueError:
+            start = 1
+        try:
+            end = int(self.pl_to.get() or total)
+        except ValueError:
+            end = total
+        start = max(1, start)
+        return start, max(start, end)
+
+    def _estimated_bytes(self) -> int | None:
+        if not self.ready:
+            return None
+        selection = self.quality.get()
+        height = int(selection[:-1]) if selection.endswith("p") and selection[:-1].isdigit() else None
+        audio, audio_format = self.audio_only.get(), self.audio_format.get()
+        if self._list_mode():
+            start, end = self._range_values()
+            entries = [entry for entry in self.playlist.entries if start <= entry.index <= end]
+            return estimate_playlist_size(entries, height, audio, audio_format)
+        if self.video_info is None:
+            return None
+        return estimate_video_size(self.video_info, height, audio, audio_format)
+
+    def _refresh_space(self) -> None:
+        free = free_space(self.output_dir.get())
+        if free is None:
+            self.space_lbl.config(text="")
+            return
+        text = f"Espacio libre: {format_size(free)}"
+        color = MUTED
+        estimate = self._estimated_bytes()
+        if estimate:
+            text += f"  ·  Descarga estimada: {format_size(estimate)}"
+            if estimate * SPACE_MARGIN > free:
+                text += "  ·  espacio insuficiente"
+                color = RED
+        self.space_lbl.config(text=text, foreground=color)
+
+    def _confirm_space(self, folder: str, estimate: int | None) -> bool:
+        free = free_space(folder)
+        if free is None:
+            return True
+        if estimate and estimate * SPACE_MARGIN > free:
+            text = (f"Se necesitan unos {format_size(estimate)} y solo hay {format_size(free)} libres en:\n{folder}\n\n"
+                    "La descarga podría fallar a mitad. ¿Continuar de todos modos?")
+        elif free < MIN_FREE_BYTES:
+            text = f"Quedan solo {format_size(free)} libres en:\n{folder}\n\n¿Continuar de todos modos?"
+        else:
+            return True
+        return messagebox.askyesno("Espacio en disco", text)
+
+    def _main_focus(self):
+        try:
+            focus = self.focus_get()
+        except KeyError:
+            return None
+        if focus is None or focus.winfo_toplevel() is not self:
+            return None
+        return focus
+
+    def _bind_shortcuts(self) -> None:
+        for sequence, handler in (("<Control-v>", self._on_global_paste), ("<Control-V>", self._on_global_paste),
+                                  ("<Control-l>", self._focus_url), ("<Control-L>", self._focus_url),
+                                  ("<Control-Return>", self._on_ctrl_enter), ("<Control-f>", self._focus_history_search),
+                                  ("<Control-F>", self._focus_history_search)):
+            self.bind_all(sequence, handler)
+        for entry in (self.entry, self.folder_entry, self.proxy_entry):
+            self._attach_context_menu(entry)
+
+    def _on_global_paste(self, _event):
+        focus = self._main_focus()
+        if focus is None or isinstance(focus, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox, ttk.Spinbox)):
+            return None
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        urls = find_urls(text)
+        if not urls:
+            self._say("El portapapeles no contiene ningún enlace.", MUTED)
+            return "break"
+        if len(urls) > 1:
+            added = self._add_urls(urls)
+            self.notebook.select(self.tab_queue)
+            self._say(self._added_message(added), MUTED)
+        else:
+            self.url.set(urls[0])
+            self.notebook.select(self.tab_download)
+            self.entry.focus_set()
+            self.entry.icursor("end")
+            self._say("Enlace pegado. Pulsa Enter para buscar.", MUTED)
+        return "break"
+
+    def _focus_url(self, _event=None):
+        if self._main_focus() is None:
+            return None
+        self.notebook.select(self.tab_download)
+        self.entry.focus_set()
+        self.entry.selection_range(0, "end")
+        return "break"
+
+    def _on_ctrl_enter(self, _event):
+        if self._main_focus() is None:
+            return None
+        if str(self.dl_btn.cget("state")) == "normal":
+            self.on_download()
+        return "break"
+
+    def _focus_history_search(self, _event=None):
+        if self._main_focus() is None:
+            return None
+        self.notebook.select(self.tab_history)
+        self.history_search.focus_set()
+        self.history_search.selection_range(0, "end")
+        return "break"
+
+    def _on_url_typed(self) -> None:
+        if self.url.get().strip():
+            self._hide_clip_bar()
+
+    def _on_focus_in(self, event) -> None:
+        if event.widget is self:
+            self.after(150, self._check_clipboard)
+
+    def _hide_clip_bar(self) -> None:
+        self.clip_bar.pack_forget()
+
+    def _check_clipboard(self) -> None:
+        if self.busy or self.ready or self.url.get().strip():
+            return
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            self._hide_clip_bar()
+            return
+        url = youtube_url(text)
+        if not url or url == self._clip_dismissed:
+            self._hide_clip_bar()
+            return
+        self._clip_url = url
+        self.clip_label.config(text=f"Enlace copiado: {shorten(url, 46)}")
+        self.clip_bar.pack(anchor="w", pady=(8, 0))
+
+    def _use_clipboard_url(self) -> None:
+        url = self._clip_url
+        self._clip_dismissed = url
+        self._hide_clip_bar()
+        if not url:
+            return
+        self.url.set(url)
+        self.notebook.select(self.tab_download)
+        self.on_search()
+
+    def _dismiss_clipboard(self) -> None:
+        self._clip_dismissed = self._clip_url
+        self._hide_clip_bar()
+
+    def _sweep_orphans(self) -> None:
+        try:
+            removed = orphans.sweep()
+        except Exception:
+            return
+        if removed:
+            self._say(f"Se limpiaron {removed} restos de descargas interrumpidas.", MUTED)
+
+    def _on_job_retry(self, data) -> None:
+        job, attempt, total = data
+        self._set_item(job, f"Reintentando ({attempt}/{total})", "run")
+        if not self.parallel_active:
+            self._say(f"Error de red. Reintentando ({attempt}/{total})...", RED)
+
+    def on_queue_save(self) -> None:
+        items = []
+        for iid in self.queue_tree.get_children():
+            url = self.item_url.get(iid)
+            if not url or self.item_state.get(iid) in FINISHED_STATES:
+                continue
+            items.append({"url": url, "title": self.queue_tree.set(iid, "video"), **self.item_extra.get(iid, {})})
+        if not items:
+            messagebox.showinfo("Guardar cola", "No hay enlaces pendientes que guardar.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Guardar cola", defaultextension=".json", initialfile="cola_llorostini",
+            filetypes=[("Cola de LLorostini (JSON)", "*.json"), ("Lista de enlaces (TXT)", "*.txt")])
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".txt"):
+                Path(path).write_text("\n".join(item["url"] for item in items) + "\n", encoding="utf-8")
+            else:
+                data = {"app": APP_NAME, "version": 1, "quality": self.queue_quality.get(),
+                        "fps": self.queue_fps.get(), "items": items}
+                Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Error", f"No se pudo guardar la cola: {exc}")
+            return
+        self._say(f"Cola guardada: {len(items)} enlaces en {Path(path).name}.", MUTED)
+
+    def on_queue_load(self) -> None:
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(
+            title="Cargar cola", filetypes=[("Cola o lista de enlaces", "*.json *.txt"), ("Todos los archivos", "*.*")])
+        if not path:
+            return
+        try:
+            items, quality, fps = read_queue_file(Path(path))
+        except OSError as exc:
+            messagebox.showerror("Error", f"No se pudo leer el archivo: {exc}")
+            return
+        if not items:
+            messagebox.showinfo("Cargar cola", "No se encontró ningún enlace válido en el archivo.")
+            return
+        known = set(self.item_url.values())
+        added = repeated = playlists = 0
+        for item in items:
+            url = item["url"]
+            if url in known:
+                repeated += 1
+                continue
+            if url_kind(url) == "playlist":
+                playlists += 1
+                continue
+            iid = self._queue_insert(url, item.get("title"))
+            extra = {key: item[key] for key in ("out_dir", "prefix", "duration") if item.get(key)}
+            if extra:
+                self.item_extra[iid] = extra
+            known.add(url)
+            added += 1
+        if quality in QUEUE_QUALITIES:
+            self.queue_quality.set(quality)
+        if fps in [FPS_AUTO] + [f"{value} fps" for value in FPS_PRESETS]:
+            self.queue_fps.set(fps)
+        self._update_queue_buttons()
+        message = f"Cola cargada: {added} enlaces"
+        if repeated:
+            message += f" ({repeated} ya estaban)"
+        if playlists:
+            message += f" · {playlists} listas omitidas (pégalas en Descargar)"
+        self._say(message + ".", MUTED)
+
+    def _attach_context_menu(self, entry) -> None:
+        menu = tk.Menu(entry, tearoff=False, bg=SURFACE, fg=FG, activebackground=ACCENT,
+                       activeforeground=ACCENT_TEXT, borderwidth=0)
+        for label, sequence in (("Cortar", "<<Cut>>"), ("Copiar", "<<Copy>>"), ("Pegar", "<<Paste>>")):
+            menu.add_command(label=label, command=lambda seq=sequence: entry.event_generate(seq))
+        menu.add_separator()
+        menu.add_command(label="Seleccionar todo", command=lambda: (entry.focus_set(), entry.selection_range(0, "end")))
+        entry.bind("<Button-3>", lambda event: (entry.focus_set(), menu.tk_popup(event.x_root, event.y_root)))
 
     def on_browse(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_dir.get())
@@ -560,6 +1053,12 @@ class App(_Base):
 
     def on_search(self) -> None:
         if self.busy:
+            return
+        self._hide_clip_bar()
+        try:
+            netutil.set_proxy(self.proxy.get())
+        except ValueError as exc:
+            messagebox.showerror("Proxy", str(exc))
             return
         self._set_busy(True)
         self.ready = False
@@ -638,6 +1137,11 @@ class App(_Base):
         subs = None
         if self.subtitles.get() and not self.audio_only.get():
             subs = next((c for c, label in SUBTITLE_CHOICES.items() if label == self.sub_lang.get()), "es")
+        try:
+            netutil.set_proxy(self.proxy.get())
+        except ValueError as exc:
+            raise DownloaderError(str(exc)) from exc
+        thumbnail = self.thumb_format.get() if self.save_thumb.get() else None
         return {
             "out": self.output_dir.get(),
             "audio": self.audio_only.get(),
@@ -645,6 +1149,9 @@ class App(_Base):
             "audio_format": self.audio_format.get(),
             "subs": subs,
             "rate": parse_rate_limit(SPEEDS.get(self.speed.get())),
+            "thumbnail": thumbnail,
+            "lyrics": bool(self.embed_lyrics.get()) and self.audio_only.get(),
+            "parallel": int(self.parallel.get() or 1),
         }
 
     def on_download(self) -> None:
@@ -656,7 +1163,7 @@ class App(_Base):
             self._download_playlist(height)
             return
         self._start_jobs([{"url": self.url.get(), "height": height, "iid": None, "fps": self._selected_fps()}],
-                         "single")
+                         "single", self._estimated_bytes())
 
     def _download_playlist(self, height: int | None) -> None:
         playlist = self.playlist
@@ -681,30 +1188,53 @@ class App(_Base):
             return
         fps = self._selected_fps()
         width = max(2, len(str(playlist.total)))
+        estimate = estimate_playlist_size(selected, height, self.audio_only.get(), self.audio_format.get())
         jobs = []
         for entry in selected:
             prefix = f"{entry.index:0{width}d} - "
             iid = self._queue_insert(entry.url, f"{prefix}{entry.title}")
-            self.item_extra[iid] = {"out_dir": folder, "prefix": prefix}
-            jobs.append({"url": entry.url, "height": height, "iid": iid, "out_dir": folder, "prefix": prefix,
+            target = (str(Path(folder) / safe_filename(entry.channel or "Sin canal"))
+                      if self.by_channel.get() else folder)
+            self.item_extra[iid] = {"out_dir": target, "prefix": prefix, "duration": entry.duration}
+            jobs.append({"url": entry.url, "height": height, "iid": iid, "out_dir": target, "prefix": prefix,
                          "fps": fps})
         self.notebook.select(self.tab_queue)
         for job in jobs:
             self._set_item(job, "En espera")
-        self._start_jobs(jobs, "queue")
+        self._start_jobs(jobs, "queue", estimate)
+        if self.busy:
+            for entry in (e for e in playlist.unavailable if start <= e.index <= end):
+                reason = ("El video es privado." if "Private" in entry.title
+                          else "El video fue eliminado." if "Deleted" in entry.title
+                          else "El video no está disponible.")
+                label = f"{entry.index:0{width}d} - {entry.title}"
+                row = self.queue_tree.insert("", "end", values=(label, f"Omitido: {reason}"), tags=("err",))
+                self.item_state[row] = "Omitido"
+                storage.add_failure(entry.url, label, reason)
+                self._notify_failure(label, reason)
+            self._refresh_history()
 
-    def _start_jobs(self, jobs: list[dict], mode: str) -> None:
+    def _start_jobs(self, jobs: list[dict], mode: str, estimate: int | None = None) -> None:
         try:
             opts = self._collect_options()
         except DownloaderError as exc:
             messagebox.showerror("Error", str(exc))
             return
+        if not self._confirm_space(jobs[0].get("out_dir") or opts["out"], estimate):
+            return
+        for position, job in enumerate(jobs):
+            job["index"] = position
         self.job_mode = mode
         self.job_total = len(jobs)
         self.job_prefix = ""
         self.results = {"ok": 0, "fail": 0}
         self.last_error = ""
         self._last_tray_percent = -1
+        self.jobs_done = 0
+        self.job_frac = {}
+        self.job_speed = {}
+        self.failures = []
+        self.notice.grid_remove()
         self.cancel_event.clear()
         self._set_busy(True)
         self.open_btn.grid_remove()
@@ -717,26 +1247,37 @@ class App(_Base):
             if self.tray.active:
                 self.withdraw()
 
-        def hook(status: dict) -> None:
-            self.events.put(("progress", status))
+        workers = max(1, min(int(opts["parallel"]), len(jobs))) if mode == "queue" else 1
+        self.parallel_active = workers > 1
+        rate = opts["rate"] // workers if opts["rate"] and workers > 1 else opts["rate"]
+
+        def run(job: dict) -> None:
+            if self.cancel_event.is_set():
+                self.events.put(("job_cancelled", job))
+                return
+            self.events.put(("job_start", (job["index"], job)))
+
+            def hook(status: dict) -> None:
+                self.events.put(("progress", (job["index"], status)))
+
+            try:
+                path = download(job["url"], job.get("out_dir") or opts["out"], job["height"], opts["audio"], hook,
+                                opts["container"], opts["audio_format"], opts["subs"], rate,
+                                self.cancel_event.is_set, job.get("prefix", ""), job.get("fps"),
+                                opts["thumbnail"], opts["lyrics"],
+                                on_retry=lambda attempt, total: self.events.put(("job_retry", (job, attempt, total))))
+                self.events.put(("job_done", (job, path, opts["audio"])))
+            except DownloadCancelledError:
+                self.events.put(("job_cancelled", job))
+            except DownloaderError as exc:
+                self.events.put(("job_error", (job, str(exc))))
+            except Exception as exc:
+                self.events.put(("job_error", (job, f"Error inesperado: {exc}")))
 
         def worker() -> None:
-            for index, job in enumerate(jobs):
-                if self.cancel_event.is_set():
-                    self.events.put(("job_cancelled", job))
-                    continue
-                self.events.put(("job_start", (index, job)))
-                try:
-                    path = download(job["url"], job.get("out_dir") or opts["out"], job["height"], opts["audio"],
-                                    hook, opts["container"], opts["audio_format"], opts["subs"], opts["rate"],
-                                    self.cancel_event.is_set, job.get("prefix", ""), job.get("fps"))
-                    self.events.put(("job_done", (job, path, opts["audio"])))
-                except DownloadCancelledError:
-                    self.events.put(("job_cancelled", job))
-                except DownloaderError as exc:
-                    self.events.put(("job_error", (job, str(exc))))
-                except Exception as exc:
-                    self.events.put(("job_error", (job, f"Error inesperado: {exc}")))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for job in jobs:
+                    pool.submit(run, job)
             self.events.put(("jobs_finished", None))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -754,14 +1295,42 @@ class App(_Base):
         shown = name if name is not None else self.queue_tree.set(iid, "video")
         self.queue_tree.item(iid, values=(shown, state), tags=(tag,) if tag else ())
 
+    def _job_title(self, job: dict) -> str:
+        iid = job.get("iid")
+        if iid and self.queue_tree.exists(iid):
+            return self.queue_tree.set(iid, "video")
+        if self.video_info is not None and not self._list_mode():
+            return self.video_info.title
+        return job["url"]
+
+    def _forget_job(self, job: dict) -> None:
+        index = job.get("index")
+        self.job_frac.pop(index, None)
+        self.job_speed.pop(index, None)
+        self.jobs_done += 1
+
+    def _notify_failure(self, title: str, message: str) -> None:
+        self.failures.append((title, message))
+        text = f"⚠ Omitido: {shorten(title, 55)} — {shorten(message, 70)}"
+        if len(self.failures) > 1:
+            text += f"   ({len(self.failures)} en total, ver Historial)"
+        self.notice.config(text=text, foreground=RED)
+        self.notice.grid()
+
     def _on_job_start(self, data) -> None:
         index, job = data
-        self.job_prefix = f"({index + 1}/{self.job_total}) " if self.job_total > 1 else ""
         self._last_tray_percent = -1
         self._set_item(job, "Descargando", "run")
+        if self.parallel_active:
+            return
+        self.job_prefix = f"({index + 1}/{self.job_total}) " if self.job_total > 1 else ""
         self._say(f"{self.job_prefix}Iniciando descarga...", MUTED)
 
-    def _on_progress(self, d: dict) -> None:
+    def _on_progress(self, data) -> None:
+        index, d = data
+        if self.parallel_active:
+            self._on_parallel_progress(index, d)
+            return
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             if total:
@@ -776,11 +1345,27 @@ class App(_Base):
             self._bar_working()
             self._say(f"{self.job_prefix}Procesando archivo...", MUTED)
 
+    def _on_parallel_progress(self, index: int, d: dict) -> None:
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total:
+                fraction = min(1.0, d["downloaded_bytes"] / total)
+                self.job_frac[index] = max(self.job_frac.get(index, 0.0), fraction)
+            self.job_speed[index] = d.get("speed") or 0
+        percent = min(100.0, (self.jobs_done + sum(self.job_frac.values())) / max(1, self.job_total) * 100)
+        self._bar_set(percent)
+        if int(percent) != self._last_tray_percent:
+            self._last_tray_percent = int(percent)
+            self.tray.set_tooltip(f"{APP_NAME} - {int(percent)}%")
+        self._say(f"Descargando {len(self.job_frac)} a la vez  ·  {self.jobs_done}/{self.job_total} listos  ·  "
+                  f"{format_size(sum(self.job_speed.values()))}/s", MUTED)
+
     def _on_job_done(self, data) -> None:
         job, path, audio = data
         self.last_path = Path(path)
         self.results["ok"] += 1
         self._set_item(job, "Listo", "ok", self.last_path.stem)
+        self._forget_job(job)
         storage.add_history(self.last_path, "audio" if audio else "video")
         self._refresh_history()
 
@@ -789,15 +1374,23 @@ class App(_Base):
         self.results["fail"] += 1
         self.last_error = message
         self._set_item(job, f"Error: {message}"[:80], "err")
+        self._forget_job(job)
+        title = self._job_title(job)
+        storage.add_failure(job["url"], title, message)
+        self._refresh_history()
+        if self.job_mode == "queue":
+            self._notify_failure(title, message)
 
     def _on_job_cancelled(self, job: dict) -> None:
         self._set_item(job, "Cancelado")
+        self._forget_job(job)
 
     def _on_jobs_finished(self, _data) -> None:
         self._bar_hide()
         self.cancel_btn.grid_remove()
         self._set_busy(False)
         self._toggle_audio()
+        self._refresh_space()
         ok, fail = self.results["ok"], self.results["fail"]
         cancelled = self.cancel_event.is_set()
 
@@ -844,11 +1437,12 @@ class App(_Base):
 
     def _update_queue_buttons(self) -> None:
         children = self.queue_tree.get_children()
-        pending = any(self.item_state.get(iid) != "Listo" for iid in children)
+        pending = any(self.item_state.get(iid) not in FINISHED_STATES for iid in children)
         self.run_q_btn.config(state="normal" if pending and not self.busy else "disabled")
         state = "disabled" if self.busy else "normal"
         self.remove_q_btn.config(state=state)
         self.clear_q_btn.config(state=state)
+        self.load_q_btn.config(state=state)
 
     def _queue_insert(self, url: str, name: str | None = None) -> str:
         iid = self.queue_tree.insert("", "end", values=(name or url, "Pendiente"))
@@ -897,7 +1491,7 @@ class App(_Base):
         buttons.pack(side="bottom", fill="x", padx=16, pady=14)
         text = tk.Text(dialog, width=40, height=8, bg=FIELD, fg=FG, insertbackground=FG, relief="flat", font=FONT,
                        wrap="none", highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
-                       padx=8, pady=8, selectbackground=ACCENT, selectforeground="#ffffff")
+                       padx=8, pady=8, selectbackground=ACCENT, selectforeground=ACCENT_TEXT)
         text.pack(fill="both", expand=True, padx=16)
 
         def load_file() -> None:
@@ -941,7 +1535,7 @@ class App(_Base):
         if self.busy:
             return
         for iid in list(self.queue_tree.get_children()):
-            if self.item_state.get(iid) == "Listo":
+            if self.item_state.get(iid) in FINISHED_STATES:
                 self.queue_tree.delete(iid)
                 self.item_state.pop(iid, None)
                 self.item_url.pop(iid, None)
@@ -957,25 +1551,47 @@ class App(_Base):
         queue_fps = int(fps_parts[0]) if fps_parts and fps_parts[0].isdigit() else None
         jobs = [{"url": self.item_url[iid], "height": height, "iid": iid, "fps": queue_fps,
                  **self.item_extra.get(iid, {})}
-                for iid in self.queue_tree.get_children() if self.item_state.get(iid) != "Listo"]
+                for iid in self.queue_tree.get_children() if self.item_state.get(iid) not in FINISHED_STATES]
         if not jobs:
             return
         for job in jobs:
             self._set_item(job, "En espera")
-        self._start_jobs(jobs, "queue")
+        seconds = sum(job.get("duration") or DEFAULT_ITEM_SECONDS for job in jobs)
+        estimate = estimate_seconds_size(seconds, height, self.audio_only.get(), self.audio_format.get())
+        self._start_jobs(jobs, "queue", estimate)
 
     def _on_tab_changed(self) -> None:
         if self.notebook.select() == str(self.tab_history):
             self._refresh_history()
 
+    def _history_text(self, entry: dict) -> str:
+        kind = "error" if entry.get("kind") == "error" else "audio" if entry.get("kind") == "audio" else "video"
+        parts = [entry.get(key, "") for key in ("title", "reason", "path", "url", "date")]
+        return " ".join(str(part) for part in parts) + " " + kind
+
     def _refresh_history(self) -> None:
         self.history_entries = storage.load_history()
         self.history_tree.delete(*self.history_tree.get_children())
+        needle = fold(self.history_filter.get().strip())
+        shown = 0
         for index, entry in enumerate(self.history_entries):
-            exists = Path(entry["path"]).exists()
+            if needle and needle not in fold(self._history_text(entry)):
+                continue
+            shown += 1
+            if entry.get("kind") == "error":
+                name = f"{entry.get('reason', '')} — {entry.get('title', '')}"
+                self.history_tree.insert("", "end", iid=str(index), values=(name, "Error", entry.get("date", "")),
+                                         tags=("err",))
+                continue
+            exists = bool(entry.get("path")) and Path(entry["path"]).exists()
             name = entry.get("title", "") + ("" if exists else "  (archivo no encontrado)")
             kind = "Audio" if entry.get("kind") == "audio" else "Video"
             self.history_tree.insert("", "end", iid=str(index), values=(name, kind, entry.get("date", "")))
+        total = len(self.history_entries)
+        if needle:
+            self.history_count.config(text=f"{shown} de {total}" if shown else "Sin resultados")
+        else:
+            self.history_count.config(text=f"{total} en total" if total else "")
         self._update_history_buttons()
 
     def _selected_history(self) -> dict | None:
@@ -987,14 +1603,14 @@ class App(_Base):
 
     def _update_history_buttons(self) -> None:
         entry = self._selected_history()
-        exists = bool(entry) and Path(entry["path"]).exists()
+        exists = bool(entry) and bool(entry.get("path")) and Path(entry["path"]).exists()
         self.play_btn.config(state="normal" if exists else "disabled")
         self.reveal_btn.config(state="normal" if exists else "disabled")
         self.forget_btn.config(state="normal" if entry else "disabled")
 
     def on_history_play(self) -> None:
         entry = self._selected_history()
-        if not entry or not Path(entry["path"]).exists():
+        if not entry or not entry.get("path") or not Path(entry["path"]).exists():
             return
         try:
             os.startfile(entry["path"])
@@ -1003,13 +1619,13 @@ class App(_Base):
 
     def on_history_reveal(self) -> None:
         entry = self._selected_history()
-        if entry:
+        if entry and entry.get("path"):
             self._reveal(Path(entry["path"]))
 
     def on_history_remove(self) -> None:
         entry = self._selected_history()
         if entry:
-            storage.remove_history(entry["path"])
+            storage.remove_history(entry)
             self._refresh_history()
 
     def on_history_clear(self) -> None:
@@ -1017,6 +1633,47 @@ class App(_Base):
                                                         "Los archivos descargados no se eliminan."):
             storage.clear_history()
             self._refresh_history()
+
+    def _build_settings_tab(self, parent) -> None:
+        frm = ttk.Frame(parent)
+        frm.pack(fill="both", expand=True, padx=16, pady=12)
+        frm.columnconfigure(1, weight=1)
+
+        def heading(row: int, text: str) -> None:
+            ttk.Label(frm, text=text, font=("Segoe UI Semibold", 11)).grid(
+                row=row, column=0, columnspan=3, sticky="w", pady=(0 if row == 0 else 16, 6))
+
+        heading(0, "Contenido")
+        ttk.Checkbutton(frm, text="Guardar la miniatura junto al archivo", variable=self.save_thumb).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Combobox(frm, state="readonly", width=8, textvariable=self.thumb_format,
+                     values=list(THUMBNAIL_FORMATS)).grid(row=1, column=2, sticky="e", pady=3)
+        ttk.Checkbutton(frm, text="Incrustar letras en el audio (MP3, M4A y FLAC)", variable=self.embed_lyrics).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=3)
+        ttk.Checkbutton(frm, text="Organizar las listas en carpetas por canal", variable=self.by_channel).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=3)
+
+        heading(4, "Red")
+        ttk.Label(frm, text="Proxy").grid(row=5, column=0, sticky="w", pady=3)
+        self.proxy_entry = ttk.Entry(frm, textvariable=self.proxy)
+        self.proxy_entry.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(14, 0), pady=3)
+        ttk.Label(frm, text="Ejemplos: http://127.0.0.1:8080 o socks5://127.0.0.1:1080. Vacío: sin proxy.",
+                  style="Muted.TLabel").grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        heading(7, "Apariencia")
+        ttk.Label(frm, text="Tema").grid(row=8, column=0, sticky="w", pady=3)
+        theme_box = ttk.Combobox(frm, state="readonly", textvariable=self.theme, values=list(PALETTES))
+        theme_box.grid(row=8, column=1, columnspan=2, sticky="ew", padx=(14, 0), pady=3)
+        theme_box.bind("<<ComboboxSelected>>", lambda _e: self.on_theme_change())
+
+        heading(9, "Rendimiento")
+        ttk.Label(frm, text="Descargas simultáneas").grid(row=10, column=0, sticky="w", pady=3)
+        ttk.Combobox(frm, state="readonly", width=8, textvariable=self.parallel, values=list(PARALLEL_CHOICES)).grid(
+            row=10, column=1, sticky="w", padx=(14, 0), pady=3)
+        ttk.Label(frm, text="Con 1 se descarga un video a la vez (recomendado). Con 2 o 3, las colas y listas "
+                            "terminan antes si tu conexión lo permite; el límite de velocidad se reparte entre ellas.",
+                  style="Muted.TLabel", wraplength=580, justify="left").grid(
+            row=11, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
     def _build_update_tab(self, parent) -> None:
         frm = ttk.Frame(parent)
@@ -1036,7 +1693,7 @@ class App(_Base):
 
         self.notes_text = tk.Text(frm, height=8, wrap="word", bg=FIELD, fg=FG, relief="flat", font=FONT,
                                   padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER,
-                                  highlightcolor=BORDER, selectbackground=ACCENT, selectforeground="#ffffff",
+                                  highlightcolor=BORDER, selectbackground=ACCENT, selectforeground=ACCENT_TEXT,
                                   insertbackground=FG, state="disabled")
         scroll = ttk.Scrollbar(frm, orient="vertical", command=self.notes_text.yview)
         self.notes_text.configure(yscrollcommand=scroll.set)
